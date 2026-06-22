@@ -15,33 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::arrow_writer::levels::LevelInfo;
 use crate::basic::Encoding;
-use crate::column::page::PageWriter;
+use crate::bloom_filter::Sbbf;
 use crate::column::writer::encoder::{
-    ColumnValueEncoder, DataPageValues, DictionaryPage,
+    ColumnValueEncoder, DataPageValues, DictionaryPage, create_bloom_filter,
 };
-use crate::column::writer::GenericColumnWriter;
 use crate::data_type::{AsBytes, ByteArray, Int32Type};
 use crate::encodings::encoding::{DeltaBitPackEncoder, Encoder};
 use crate::encodings::rle::RleEncoder;
 use crate::errors::{ParquetError, Result};
-use crate::file::properties::{WriterProperties, WriterPropertiesPtr, WriterVersion};
-use crate::file::writer::OnCloseColumnChunk;
+use crate::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
+use crate::geospatial::statistics::GeospatialStatistics;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
-use arrow::array::{
-    Array, ArrayAccessor, ArrayRef, BinaryArray, DictionaryArray, LargeBinaryArray,
-    LargeStringArray, StringArray,
+use arrow_array::types::ByteArrayType;
+use arrow_array::{
+    Array, ArrayAccessor, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray,
+    GenericByteArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
 };
-use arrow::datatypes::DataType;
+use arrow_buffer::{ArrowNativeType, Buffer};
+use arrow_schema::DataType;
 
 macro_rules! downcast_dict_impl {
     ($array:ident, $key:ident, $val:ident, $op:expr $(, $arg:expr)*) => {{
         $op($array
             .as_any()
-            .downcast_ref::<DictionaryArray<arrow::datatypes::$key>>()
+            .downcast_ref::<DictionaryArray<arrow_array::types::$key>>()
             .unwrap()
             .downcast_dict::<$val>()
             .unwrap()$(, $arg)*)
@@ -71,11 +72,15 @@ macro_rules! downcast_op {
             DataType::LargeUtf8 => {
                 $op($array.as_any().downcast_ref::<LargeStringArray>().unwrap()$(, $arg)*)
             }
+            DataType::Utf8View => $op($array.as_any().downcast_ref::<StringViewArray>().unwrap()$(, $arg)*),
             DataType::Binary => {
                 $op($array.as_any().downcast_ref::<BinaryArray>().unwrap()$(, $arg)*)
             }
             DataType::LargeBinary => {
                 $op($array.as_any().downcast_ref::<LargeBinaryArray>().unwrap()$(, $arg)*)
+            }
+            DataType::BinaryView => {
+                $op($array.as_any().downcast_ref::<BinaryViewArray>().unwrap()$(, $arg)*)
             }
             DataType::Dictionary(key, value) => match value.as_ref() {
                 DataType::Utf8 => downcast_dict_op!(key, StringArray, $array, $op$(, $arg)*),
@@ -86,6 +91,9 @@ macro_rules! downcast_op {
                 DataType::LargeBinary => {
                     downcast_dict_op!(key, LargeBinaryArray, $array, $op$(, $arg)*)
                 }
+                DataType::FixedSizeBinary(_) => {
+                    downcast_dict_op!(key, FixedSizeBinaryArray, $array, $op$(, $arg)*)
+                }
                 d => unreachable!("cannot downcast {} dictionary value to byte array", d),
             },
             d => unreachable!("cannot downcast {} to byte array", d),
@@ -93,60 +101,11 @@ macro_rules! downcast_op {
     };
 }
 
-/// A writer for byte array types
-pub(super) struct ByteArrayWriter<'a> {
-    writer: GenericColumnWriter<'a, ByteArrayEncoder>,
-    on_close: Option<OnCloseColumnChunk<'a>>,
-}
-
-impl<'a> ByteArrayWriter<'a> {
-    /// Returns a new [`ByteArrayWriter`]
-    pub fn new(
-        descr: ColumnDescPtr,
-        props: &'a WriterPropertiesPtr,
-        page_writer: Box<dyn PageWriter + 'a>,
-        on_close: OnCloseColumnChunk<'a>,
-    ) -> Result<Self> {
-        Ok(Self {
-            writer: GenericColumnWriter::new(descr, props.clone(), page_writer),
-            on_close: Some(on_close),
-        })
-    }
-
-    pub fn write(&mut self, array: &ArrayRef, levels: LevelInfo) -> Result<()> {
-        self.writer.write_batch_internal(
-            array,
-            Some(levels.non_null_indices()),
-            levels.def_levels(),
-            levels.rep_levels(),
-            None,
-            None,
-            None,
-        )?;
-        Ok(())
-    }
-
-    pub fn close(self) -> Result<()> {
-        let (bytes_written, rows_written, metadata, column_index, offset_index) =
-            self.writer.close()?;
-
-        if let Some(on_close) = self.on_close {
-            on_close(
-                bytes_written,
-                rows_written,
-                metadata,
-                column_index,
-                offset_index,
-            )?;
-        }
-        Ok(())
-    }
-}
-
 /// A fallback encoder, i.e. non-dictionary, for [`ByteArray`]
 struct FallbackEncoder {
     encoder: FallbackEncoderImpl,
     num_values: usize,
+    variable_length_bytes: i64,
 }
 
 /// The fallback encoder in use
@@ -172,12 +131,13 @@ impl FallbackEncoder {
     /// Create the fallback encoder for the given [`ColumnDescPtr`] and [`WriterProperties`]
     fn new(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self> {
         // Set either main encoder or fallback encoder.
-        let encoding = props.encoding(descr.path()).unwrap_or_else(|| {
-            match props.writer_version() {
-                WriterVersion::PARQUET_1_0 => Encoding::PLAIN,
-                WriterVersion::PARQUET_2_0 => Encoding::DELTA_BYTE_ARRAY,
-            }
-        });
+        let encoding =
+            props
+                .encoding(descr.path())
+                .unwrap_or_else(|| match props.writer_version() {
+                    WriterVersion::PARQUET_1_0 => Encoding::PLAIN,
+                    WriterVersion::PARQUET_2_0 => Encoding::DELTA_BYTE_ARRAY,
+                });
 
         let encoder = match encoding {
             Encoding::PLAIN => FallbackEncoderImpl::Plain { buffer: vec![] },
@@ -195,18 +155,19 @@ impl FallbackEncoder {
                 return Err(general_err!(
                     "unsupported encoding {} for byte array",
                     encoding
-                ))
+                ));
             }
         };
 
         Ok(Self {
             encoder,
             num_values: 0,
+            variable_length_bytes: 0,
         })
     }
 
     /// Encode `values` to the in-progress page
-    fn encode<T>(&mut self, values: T, indices: &[usize])
+    fn encode<T>(&mut self, values: T, indices: impl ExactSizeIterator<Item = usize>)
     where
         T: ArrayAccessor + Copy,
         T::Item: AsRef<[u8]>,
@@ -215,18 +176,20 @@ impl FallbackEncoder {
         match &mut self.encoder {
             FallbackEncoderImpl::Plain { buffer } => {
                 for idx in indices {
-                    let value = values.value(*idx);
+                    let value = values.value(idx);
                     let value = value.as_ref();
                     buffer.extend_from_slice((value.len() as u32).as_bytes());
-                    buffer.extend_from_slice(value)
+                    buffer.extend_from_slice(value);
+                    self.variable_length_bytes += value.len() as i64;
                 }
             }
             FallbackEncoderImpl::DeltaLength { buffer, lengths } => {
                 for idx in indices {
-                    let value = values.value(*idx);
+                    let value = values.value(idx);
                     let value = value.as_ref();
                     lengths.put(&[value.len() as i32]).unwrap();
                     buffer.extend_from_slice(value);
+                    self.variable_length_bytes += value.len() as i64;
                 }
             }
             FallbackEncoderImpl::Delta {
@@ -236,7 +199,7 @@ impl FallbackEncoder {
                 suffix_lengths,
             } => {
                 for idx in indices {
-                    let value = values.value(*idx);
+                    let value = values.value(idx);
                     let value = value.as_ref();
                     let mut prefix_length = 0;
 
@@ -255,11 +218,16 @@ impl FallbackEncoder {
                     buffer.extend_from_slice(&value[prefix_length..]);
                     prefix_lengths.put(&[prefix_length as i32]).unwrap();
                     suffix_lengths.put(&[suffix_length as i32]).unwrap();
+                    self.variable_length_bytes += value.len() as i64;
                 }
             }
         }
     }
 
+    /// Returns an estimate of the data page size in bytes
+    ///
+    /// This includes:
+    /// <already_written_encoded_byte_size> + <estimated_encoded_size_of_unflushed_bytes>
     fn estimated_data_page_size(&self) -> usize {
         match &self.encoder {
             FallbackEncoderImpl::Plain { buffer, .. } => buffer.len(),
@@ -285,35 +253,39 @@ impl FallbackEncoder {
         max_value: Option<ByteArray>,
     ) -> Result<DataPageValues<ByteArray>> {
         let (buf, encoding) = match &mut self.encoder {
-            FallbackEncoderImpl::Plain { buffer } => {
-                (std::mem::take(buffer), Encoding::PLAIN)
-            }
+            FallbackEncoderImpl::Plain { buffer } => (std::mem::take(buffer), Encoding::PLAIN),
             FallbackEncoderImpl::DeltaLength { buffer, lengths } => {
                 let lengths = lengths.flush_buffer()?;
 
                 let mut out = Vec::with_capacity(lengths.len() + buffer.len());
-                out.extend_from_slice(lengths.data());
+                out.extend_from_slice(&lengths);
                 out.extend_from_slice(buffer);
+                buffer.clear();
                 (out, Encoding::DELTA_LENGTH_BYTE_ARRAY)
             }
             FallbackEncoderImpl::Delta {
                 buffer,
                 prefix_lengths,
                 suffix_lengths,
-                ..
+                last_value,
             } => {
                 let prefix_lengths = prefix_lengths.flush_buffer()?;
                 let suffix_lengths = suffix_lengths.flush_buffer()?;
 
-                let mut out = Vec::with_capacity(
-                    prefix_lengths.len() + suffix_lengths.len() + buffer.len(),
-                );
-                out.extend_from_slice(prefix_lengths.data());
-                out.extend_from_slice(suffix_lengths.data());
+                let mut out =
+                    Vec::with_capacity(prefix_lengths.len() + suffix_lengths.len() + buffer.len());
+                out.extend_from_slice(&prefix_lengths);
+                out.extend_from_slice(&suffix_lengths);
                 out.extend_from_slice(buffer);
+                buffer.clear();
+                last_value.clear();
                 (out, Encoding::DELTA_BYTE_ARRAY)
             }
         };
+
+        // Capture value of variable_length_bytes and reset for next page
+        let variable_length_bytes = Some(self.variable_length_bytes);
+        self.variable_length_bytes = 0;
 
         Ok(DataPageValues {
             buf: buf.into(),
@@ -321,6 +293,7 @@ impl FallbackEncoder {
             encoding,
             min_value,
             max_value,
+            variable_length_bytes,
         })
     }
 }
@@ -354,6 +327,12 @@ impl Storage for ByteArrayStorage {
 
         key as u64
     }
+
+    #[allow(dead_code)] // not used in parquet_derive, so is dead there
+    fn estimated_memory_size(&self) -> usize {
+        self.page.capacity() * std::mem::size_of::<u8>()
+            + self.values.capacity() * std::mem::size_of::<std::ops::Range<usize>>()
+    }
 }
 
 /// A dictionary encoder for byte array data
@@ -361,11 +340,12 @@ impl Storage for ByteArrayStorage {
 struct DictEncoder {
     interner: Interner<ByteArrayStorage>,
     indices: Vec<u64>,
+    variable_length_bytes: i64,
 }
 
 impl DictEncoder {
     /// Encode `values` to the in-progress page
-    fn encode<T>(&mut self, values: T, indices: &[usize])
+    fn encode<T>(&mut self, values: T, indices: impl ExactSizeIterator<Item = usize>)
     where
         T: ArrayAccessor + Copy,
         T::Item: AsRef<[u8]>,
@@ -373,9 +353,10 @@ impl DictEncoder {
         self.indices.reserve(indices.len());
 
         for idx in indices {
-            let value = values.value(*idx);
+            let value = values.value(idx);
             let interned = self.interner.intern(value.as_ref());
             self.indices.push(interned);
+            self.variable_length_bytes += value.as_ref().len() as i64;
         }
     }
 
@@ -384,10 +365,13 @@ impl DictEncoder {
         num_required_bits(length.saturating_sub(1) as u64)
     }
 
+    fn estimated_memory_size(&self) -> usize {
+        self.interner.estimated_memory_size() + self.indices.capacity() * std::mem::size_of::<u64>()
+    }
+
     fn estimated_data_page_size(&self) -> usize {
         let bit_width = self.bit_width();
-        1 + RleEncoder::min_buffer_size(bit_width)
-            + RleEncoder::max_buffer_size(bit_width, self.indices.len())
+        1 + RleEncoder::max_buffer_size(bit_width, self.indices.len())
     }
 
     fn estimated_dict_page_size(&self) -> usize {
@@ -412,14 +396,18 @@ impl DictEncoder {
         let num_values = self.indices.len();
         let buffer_len = self.estimated_data_page_size();
         let mut buffer = Vec::with_capacity(buffer_len);
-        buffer.push(self.bit_width() as u8);
+        buffer.push(self.bit_width());
 
         let mut encoder = RleEncoder::new_from_buf(self.bit_width(), buffer);
         for index in &self.indices {
-            encoder.put(*index as u64)
+            encoder.put(*index)
         }
 
         self.indices.clear();
+
+        // Capture value of variable_length_bytes and reset for next page
+        let variable_length_bytes = Some(self.variable_length_bytes);
+        self.variable_length_bytes = 0;
 
         DataPageValues {
             buf: encoder.consume().into(),
@@ -427,37 +415,29 @@ impl DictEncoder {
             encoding: Encoding::RLE_DICTIONARY,
             min_value,
             max_value,
+            variable_length_bytes,
         }
     }
 }
 
-struct ByteArrayEncoder {
+pub struct ByteArrayEncoder {
     fallback: FallbackEncoder,
     dict_encoder: Option<DictEncoder>,
-    num_values: usize,
+    statistics_enabled: EnabledStatistics,
     min_value: Option<ByteArray>,
     max_value: Option<ByteArray>,
+    bloom_filter: Option<Sbbf>,
+    bloom_filter_target_fpp: f64,
+    geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
 }
 
 impl ColumnValueEncoder for ByteArrayEncoder {
     type T = ByteArray;
-    type Values = ArrayRef;
-
-    fn min_max(
-        &self,
-        values: &ArrayRef,
-        value_indices: Option<&[usize]>,
-    ) -> Option<(Self::T, Self::T)> {
-        match value_indices {
-            Some(indices) => {
-                let iter = indices.iter().cloned();
-                downcast_op!(values.data_type(), values, compute_min_max, iter)
-            }
-            None => {
-                let len = Array::len(values);
-                downcast_op!(values.data_type(), values, compute_min_max, 0..len)
-            }
-        }
+    type Values = dyn Array;
+    fn flush_bloom_filter(&mut self) -> Option<Sbbf> {
+        let mut sbbf = self.bloom_filter.take()?;
+        sbbf.fold_to_target_fpp(self.bloom_filter_target_fpp);
+        Some(sbbf)
     }
 
     fn try_new(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self>
@@ -470,41 +450,156 @@ impl ColumnValueEncoder for ByteArrayEncoder {
 
         let fallback = FallbackEncoder::new(descr, props)?;
 
+        let (bloom_filter, bloom_filter_target_fpp) = create_bloom_filter(props, descr)?;
+
+        let statistics_enabled = props.statistics_enabled(descr.path());
+
+        let geo_stats_accumulator = try_new_geo_stats_accumulator(descr);
+
         Ok(Self {
             fallback,
+            statistics_enabled,
+            bloom_filter,
+            bloom_filter_target_fpp,
             dict_encoder: dictionary,
-            num_values: 0,
             min_value: None,
             max_value: None,
+            geo_stats_accumulator,
         })
     }
 
-    fn write(
-        &mut self,
-        _values: &Self::Values,
-        _offset: usize,
-        _len: usize,
-    ) -> Result<()> {
+    fn write(&mut self, _values: &Self::Values, _offset: usize, _len: usize) -> Result<()> {
         unreachable!("should call write_gather instead")
     }
 
     fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
-        downcast_op!(values.data_type(), values, encode, indices, self);
+        downcast_op!(
+            values.data_type(),
+            values,
+            encode,
+            indices.iter().copied(),
+            self
+        );
         Ok(())
     }
 
+    fn count_values_within_byte_budget_gather(
+        values: &Self::Values,
+        indices: &[usize],
+        byte_budget: usize,
+    ) -> Option<usize> {
+        // `ByteArrayEncoder` only ever writes via `write_gather`, so this
+        // is the relevant method.
+        //
+        // Two-stage walk for the simple offset-buffer byte array types:
+        //   1. If indices are contiguous, compute the total payload in
+        //      O(1) via a single subtraction on the offsets buffer.
+        //      When the total fits the budget — the overwhelmingly
+        //      common "small values" case — return immediately.
+        //   2. Otherwise, walk per-value byte sizes from the offsets
+        //      buffer (still cheap, no slice/UTF-8 construction) and
+        //      exit at the first value that pushes the cumulative sum
+        //      past the budget. This bounds skewed distributions: an
+        //      outlier value is caught wherever it lands in the chunk.
+        let count = match values.data_type() {
+            DataType::Utf8 => count_within_budget_offsets(
+                values.as_any().downcast_ref::<StringArray>().unwrap(),
+                indices,
+                byte_budget,
+            ),
+            DataType::LargeUtf8 => count_within_budget_offsets(
+                values.as_any().downcast_ref::<LargeStringArray>().unwrap(),
+                indices,
+                byte_budget,
+            ),
+            DataType::Binary => count_within_budget_offsets(
+                values.as_any().downcast_ref::<BinaryArray>().unwrap(),
+                indices,
+                byte_budget,
+            ),
+            DataType::LargeBinary => count_within_budget_offsets(
+                values.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+                indices,
+                byte_budget,
+            ),
+            // View arrays carry each value's length in the low 32 bits of
+            // its u128 view word, so lengths are scannable without touching
+            // any data buffer — and the common small-value case skips even
+            // that scan via an O(1) conservative bound.
+            DataType::Utf8View => {
+                let array = values.as_any().downcast_ref::<StringViewArray>().unwrap();
+                count_within_budget_views(
+                    array.views(),
+                    indices,
+                    byte_budget,
+                    max_view_value_len(array.data_buffers()),
+                )
+            }
+            DataType::BinaryView => {
+                let array = values.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+                count_within_budget_views(
+                    array.views(),
+                    indices,
+                    byte_budget,
+                    max_view_value_len(array.data_buffers()),
+                )
+            }
+            // The values in an arrow dictionary are already small and
+            // deduplicated, so there is nothing to bound — treat every
+            // chunk as fitting and stay on the batched path. (A per-value
+            // walk through dict keys on every chunk also measured ~+30-80%
+            // slower than `main`.)
+            DataType::Dictionary(_, _) => indices.len(),
+            // Every byte-array type `ByteArrayEncoder` is constructed for
+            // has an explicit arm above. A `Dictionary(value = FixedSizeBinary)`
+            // column hits the `Dictionary(_, _)` arm (its `values.data_type()`
+            // is `Dictionary`), and a bare `FixedSizeBinary` column is routed
+            // to the generic column writer, never this encoder — so no other
+            // type can reach here.
+            data_type => unreachable!("ByteArrayEncoder cannot be constructed for {data_type:?}"),
+        };
+        Some(count)
+    }
+
     fn num_values(&self) -> usize {
-        self.num_values
+        match &self.dict_encoder {
+            Some(encoder) => encoder.indices.len(),
+            None => self.fallback.num_values,
+        }
     }
 
     fn has_dictionary(&self) -> bool {
         self.dict_encoder.is_some()
     }
 
+    fn estimated_memory_size(&self) -> usize {
+        let encoder_size = match &self.dict_encoder {
+            Some(encoder) => encoder.estimated_memory_size(),
+            // For the FallbackEncoder, these unflushed bytes are already encoded.
+            // Therefore, the size should be the same as estimated_data_page_size.
+            None => self.fallback.estimated_data_page_size(),
+        };
+
+        let bloom_filter_size = self
+            .bloom_filter
+            .as_ref()
+            .map(|bf| bf.estimated_memory_size())
+            .unwrap_or_default();
+
+        let stats_size = self.min_value.as_ref().map(|v| v.len()).unwrap_or_default()
+            + self.max_value.as_ref().map(|v| v.len()).unwrap_or_default();
+
+        encoder_size + bloom_filter_size + stats_size
+    }
+
     fn estimated_dict_page_size(&self) -> Option<usize> {
         Some(self.dict_encoder.as_ref()?.estimated_dict_page_size())
     }
 
+    /// Returns an estimate of the data page size in bytes
+    ///
+    /// This includes:
+    /// <already_written_encoded_byte_size> + <estimated_encoded_size_of_unflushed_bytes>
     fn estimated_data_page_size(&self) -> usize {
         match &self.dict_encoder {
             Some(encoder) => encoder.estimated_data_page_size(),
@@ -515,7 +610,7 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     fn flush_dict_page(&mut self) -> Result<Option<DictionaryPage>> {
         match self.dict_encoder.take() {
             Some(encoder) => {
-                if self.num_values != 0 {
+                if !encoder.indices.is_empty() {
                     return Err(general_err!(
                         "Must flush data pages before flushing dictionary"
                     ));
@@ -536,23 +631,39 @@ impl ColumnValueEncoder for ByteArrayEncoder {
             _ => self.fallback.flush_data_page(min_value, max_value),
         }
     }
+
+    fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
+        self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
+    }
 }
 
 /// Encodes the provided `values` and `indices` to `encoder`
 ///
 /// This is a free function so it can be used with `downcast_op!`
-fn encode<T>(values: T, indices: &[usize], encoder: &mut ByteArrayEncoder)
+fn encode<T, I>(values: T, indices: I, encoder: &mut ByteArrayEncoder)
 where
     T: ArrayAccessor + Copy,
     T::Item: Copy + Ord + AsRef<[u8]>,
+    I: ExactSizeIterator<Item = usize> + Clone,
 {
-    if let Some((min, max)) = compute_min_max(values, indices.iter().cloned()) {
-        if encoder.min_value.as_ref().map_or(true, |m| m > &min) {
-            encoder.min_value = Some(min);
-        }
+    if encoder.statistics_enabled != EnabledStatistics::None {
+        if let Some(accumulator) = encoder.geo_stats_accumulator.as_mut() {
+            update_geo_stats_accumulator(accumulator.as_mut(), values, indices.clone());
+        } else if let Some((min, max)) = compute_min_max(values, indices.clone()) {
+            if encoder.min_value.as_ref().is_none_or(|m| m > &min) {
+                encoder.min_value = Some(min);
+            }
 
-        if encoder.max_value.as_ref().map_or(true, |m| m < &max) {
-            encoder.max_value = Some(max);
+            if encoder.max_value.as_ref().is_none_or(|m| m < &max) {
+                encoder.max_value = Some(max);
+            }
+        }
+    }
+
+    // encode the values into bloom filter if enabled
+    if let Some(bloom_filter) = &mut encoder.bloom_filter {
+        for idx in indices.clone() {
+            bloom_filter.insert(values.value(idx).as_ref());
         }
     }
 
@@ -560,6 +671,105 @@ where
         Some(dict_encoder) => dict_encoder.encode(values, indices),
         None => encoder.fallback.encode(values, indices),
     }
+}
+
+/// Upper bound on any single value's byte length in a view array.
+fn max_view_value_len(buffers: &[Buffer]) -> usize {
+    /// Bytes that fit inline in a u128 view word (the rest is len + prefix).
+    const MAX_INLINE_VIEW_LEN: usize = 12;
+    // An out-of-line view's data is a contiguous slice of exactly one data
+    // buffer, so it cannot exceed the largest buffer; inline views hold at
+    // most `MAX_INLINE_VIEW_LEN`. Loose (a value is usually far smaller than
+    // a whole buffer) but O(number of buffers) and always sound.
+    buffers
+        .iter()
+        .map(|b| b.len())
+        .max()
+        .unwrap_or(0)
+        .max(MAX_INLINE_VIEW_LEN)
+}
+
+/// Number of leading `indices` whose cumulative plain-encoded size fits
+/// `byte_budget` (boundary value included), for view arrays (`Utf8View`,
+/// `BinaryView`).
+fn count_within_budget_views(
+    views: &[u128],
+    indices: &[usize],
+    byte_budget: usize,
+    max_value_len: usize,
+) -> usize {
+    // Each plain-encoded BYTE_ARRAY value carries a 4-byte length prefix, so
+    // the budget is compared against `value_len + size_of::<u32>()` — the
+    // bytes actually written to the page, not just the payload.
+    //
+    // Stage 1: O(1) conservative bound. View arrays have no prefix-sum
+    // offsets buffer, so the exact span subtraction used by
+    // `count_within_budget_offsets` is unavailable; instead bound every
+    // value by `max_value_len`. Skips the walk for the common small-value
+    // case (what view arrays are built for, and where there is nothing to
+    // bound).
+    let per_value = max_value_len + std::mem::size_of::<u32>();
+    if indices.len().saturating_mul(per_value) <= byte_budget {
+        return indices.len();
+    }
+    // Stage 2: exact per-value scan, reading each length from the low 32
+    // bits of its u128 view word (no data-buffer dereference).
+    let mut cum: usize = 0;
+    for (i, idx) in indices.iter().enumerate() {
+        let len = (views[*idx] as u32) as usize;
+        cum = cum.saturating_add(len + std::mem::size_of::<u32>());
+        if cum > byte_budget {
+            return i + 1;
+        }
+    }
+    indices.len()
+}
+
+/// Number of leading `indices` whose cumulative plain-encoded size fits
+/// `byte_budget` (boundary value included), for offset-buffer byte arrays
+/// (`Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`).
+///
+/// `indices` are assumed sorted ascending — they always are here, since
+/// they come from `non_null_indices`, which is built in array order.
+fn count_within_budget_offsets<T: ByteArrayType>(
+    values: &GenericByteArray<T>,
+    indices: &[usize],
+    byte_budget: usize,
+) -> usize {
+    if indices.is_empty() {
+        return 0;
+    }
+    let n = indices.len();
+    let first = indices[0];
+    let last = indices[n - 1];
+    let offsets = values.value_offsets();
+    // Each plain-encoded value carries a 4-byte length prefix on the page.
+    let prefix_overhead = std::mem::size_of::<u32>();
+
+    // Stage 1: O(1) span upper bound. The span `offsets[last+1] -
+    // offsets[first]` covers every array position in `[first, last]`, a
+    // superset of `indices` — and the skipped positions in a nullable
+    // column are nulls with zero offset delta, so the span still equals the
+    // exact payload. If it fits the budget, every value fits. Covers the
+    // common small-value case for both non-null and (sparse) nullable
+    // columns.
+    if last >= first {
+        let payload = (offsets[last + 1] - offsets[first]).as_usize();
+        if payload + n * prefix_overhead <= byte_budget {
+            return n;
+        }
+    }
+
+    // Stage 2: scan per-index lengths from the offsets buffer.
+    let mut cum: usize = 0;
+    for (i, idx) in indices.iter().enumerate() {
+        let len = (offsets[idx + 1] - offsets[*idx]).as_usize() + prefix_overhead;
+        cum = cum.saturating_add(len);
+        if cum > byte_budget {
+            return i + 1;
+        }
+    }
+    n
 }
 
 /// Computes the min and max for the provided array and indices
@@ -584,4 +794,21 @@ where
         max = max.max(val);
     }
     Some((min.as_ref().to_vec().into(), max.as_ref().to_vec().into()))
+}
+
+/// Updates geospatial statistics for the provided array and indices
+fn update_geo_stats_accumulator<T>(
+    bounder: &mut dyn GeoStatsAccumulator,
+    array: T,
+    valid: impl Iterator<Item = usize>,
+) where
+    T: ArrayAccessor,
+    T::Item: Copy + Ord + AsRef<[u8]>,
+{
+    if bounder.is_valid() {
+        for idx in valid {
+            let val = array.value(idx);
+            bounder.update_wkb(val.as_ref());
+        }
+    }
 }

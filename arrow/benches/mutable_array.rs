@@ -31,15 +31,16 @@ fn create_slices(size: usize) -> Vec<(usize, usize)> {
 
     (0..size)
         .map(|_| {
-            let start = rng.gen_range(0..size / 2);
-            let end = rng.gen_range(start + 1..size);
+            let start = rng.random_range(0..size / 2);
+            let end = rng.random_range(start + 1..size);
             (start, end)
         })
         .collect()
 }
 
 fn bench<T: Array>(v1: &T, slices: &[(usize, usize)]) {
-    let mut mutable = MutableArrayData::new(vec![v1.data_ref()], false, 5);
+    let data = v1.to_data();
+    let mut mutable = MutableArrayData::new(vec![&data], false, 5);
     for (start, end) in slices {
         mutable.extend(0, *start, *end)
     }

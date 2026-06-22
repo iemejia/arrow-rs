@@ -20,9 +20,11 @@
 use std::fmt;
 
 use chrono::{TimeZone, Utc};
+use half::f16;
 use num_bigint::{BigInt, Sign};
+use num_traits::Float;
 
-use crate::basic::{ConvertedType, Type as PhysicalType};
+use crate::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use crate::data_type::{ByteArray, Decimal, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
@@ -50,9 +52,34 @@ pub struct Row {
 
 #[allow(clippy::len_without_is_empty)]
 impl Row {
+    /// Constructs a `Row` from the list of `fields` and returns it.
+    pub fn new(fields: Vec<(String, Field)>) -> Row {
+        Row { fields }
+    }
+
     /// Get the number of fields in this row.
     pub fn len(&self) -> usize {
         self.fields.len()
+    }
+
+    /// Move columns data out of the row. Useful to avoid internal data cloning.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::fs::File;
+    /// use parquet::record::Row;
+    /// use parquet::file::reader::{FileReader, SerializedFileReader};
+    ///
+    /// let file = File::open("/path/to/file").unwrap();
+    /// let reader = SerializedFileReader::new(file).unwrap();
+    /// let row: Row = reader.get_row_iter(None).unwrap().next().unwrap().unwrap();
+    /// let columns = row.into_columns();
+    /// println!("row columns: {:?}", columns);
+    ///
+    /// ```
+    pub fn into_columns(self) -> Vec<(String, Field)> {
+        self.fields
     }
 
     /// Get an iterator to go through all columns in the row.
@@ -66,12 +93,12 @@ impl Row {
     ///
     /// let file = File::open("/path/to/file").unwrap();
     /// let reader = SerializedFileReader::new(file).unwrap();
-    /// let row: Row = reader.get_row_iter(None).unwrap().next().unwrap();
+    /// let row: Row = reader.get_row_iter(None).unwrap().next().unwrap().unwrap();
     /// for (idx, (name, field)) in row.get_column_iter().enumerate() {
     ///     println!("column index: {}, column name: {}, column value: {}", idx, name, field);
     /// }
     /// ```
-    pub fn get_column_iter(&self) -> RowColumnIter {
+    pub fn get_column_iter(&self) -> RowColumnIter<'_> {
         RowColumnIter {
             fields: &self.fields,
             curr: 0,
@@ -79,6 +106,7 @@ impl Row {
         }
     }
 
+    /// Converts the row into a JSON object.
     #[cfg(any(feature = "json", test))]
     pub fn to_json_value(&self) -> Value {
         Value::Object(
@@ -112,28 +140,51 @@ impl<'a> Iterator for RowColumnIter<'a> {
 
 /// Trait for type-safe convenient access to fields within a Row.
 pub trait RowAccessor {
+    /// Check if the field at the index is null.
+    fn is_null(&self, i: usize) -> Result<bool>;
+    /// Try to get a boolean value at the given index.
     fn get_bool(&self, i: usize) -> Result<bool>;
+    /// Try to get a byte value at the given index.
     fn get_byte(&self, i: usize) -> Result<i8>;
+    /// Try to get a short value at the given index.
     fn get_short(&self, i: usize) -> Result<i16>;
+    /// Try to get a int value at the given index.
     fn get_int(&self, i: usize) -> Result<i32>;
+    /// Try to get a long value at the given index.
     fn get_long(&self, i: usize) -> Result<i64>;
+    /// Try to get a ubyte value at the given index.
     fn get_ubyte(&self, i: usize) -> Result<u8>;
+    /// Try to get a ushort value at the given index.
     fn get_ushort(&self, i: usize) -> Result<u16>;
+    /// Try to get a uint value at the given index.
     fn get_uint(&self, i: usize) -> Result<u32>;
+    /// Try to get a ulong value at the given index.
     fn get_ulong(&self, i: usize) -> Result<u64>;
+    /// Try to get a float16 value at the given index.
+    fn get_float16(&self, i: usize) -> Result<f16>;
+    /// Try to get a float value at the given index.
     fn get_float(&self, i: usize) -> Result<f32>;
+    /// Try to get a double value at the given index.
     fn get_double(&self, i: usize) -> Result<f64>;
-    fn get_timestamp_millis(&self, i: usize) -> Result<u64>;
-    fn get_timestamp_micros(&self, i: usize) -> Result<u64>;
+    /// Try to get a date value at the given index.
+    fn get_timestamp_millis(&self, i: usize) -> Result<i64>;
+    /// Try to get a date value at the given index.
+    fn get_timestamp_micros(&self, i: usize) -> Result<i64>;
+    /// Try to get a decimal value at the given index.
     fn get_decimal(&self, i: usize) -> Result<&Decimal>;
+    /// Try to get a string value at the given index.
     fn get_string(&self, i: usize) -> Result<&String>;
+    /// Try to get a bytes value at the given index.
     fn get_bytes(&self, i: usize) -> Result<&ByteArray>;
+    /// Try to get a group value at the given index.
     fn get_group(&self, i: usize) -> Result<&Row>;
+    /// Try to get a list value at the given index.
     fn get_list(&self, i: usize) -> Result<&List>;
+    /// Try to get a map value at the given index.
     fn get_map(&self, i: usize) -> Result<&Map>;
 }
 
-/// Trait for formating fields within a Row.
+/// Trait for formatting fields within a Row.
 ///
 /// # Examples
 ///
@@ -146,12 +197,13 @@ pub trait RowAccessor {
 ///
 /// if let Ok(file) = File::open(&Path::new("test.parquet")) {
 ///     let reader = SerializedFileReader::new(file).unwrap();
-///     let row = reader.get_row_iter(None).unwrap().next().unwrap();
+///     let row = reader.get_row_iter(None).unwrap().next().unwrap().unwrap();
 ///     println!("column 0: {}, column 1: {}", row.fmt(0), row.fmt(1));
 /// }
 /// ```
 ///
 pub trait RowFormatter {
+    /// The method to format a field at the given index.
     fn fmt(&self, i: usize) -> &dyn fmt::Display;
 }
 
@@ -160,11 +212,12 @@ pub trait RowFormatter {
 macro_rules! row_primitive_accessor {
     ($METHOD:ident, $VARIANT:ident, $TY:ty) => {
         fn $METHOD(&self, i: usize) -> Result<$TY> {
-            match self.fields[i].1 {
-                Field::$VARIANT(v) => Ok(v),
+            match self.fields.get(i) {
+                Some((_, Field::$VARIANT(v))) => Ok(*v),
+                None => Err(ParquetError::IndexOutOfBound(i, self.fields.len())),
                 _ => Err(general_err!(
                     "Cannot access {} as {}",
-                    self.fields[i].1.get_type_name(),
+                    self.fields[i].1.get_type_name(), // Safe access as None is
                     stringify!($VARIANT)
                 )),
             }
@@ -177,11 +230,13 @@ macro_rules! row_primitive_accessor {
 macro_rules! row_complex_accessor {
     ($METHOD:ident, $VARIANT:ident, $TY:ty) => {
         fn $METHOD(&self, i: usize) -> Result<&$TY> {
-            match self.fields[i].1 {
-                Field::$VARIANT(ref v) => Ok(v),
+            match self.fields.get(i) {
+                Some((_, Field::$VARIANT(v))) => Ok(v),
+                None => Err(ParquetError::IndexOutOfBound(i, self.fields.len())),
                 _ => Err(general_err!(
                     "Cannot access {} as {}",
-                    self.fields[i].1.get_type_name(),
+                    self.fields[i].1.get_type_name(), // Safe access as None is
+                    // just checked.
                     stringify!($VARIANT)
                 )),
             }
@@ -192,11 +247,23 @@ macro_rules! row_complex_accessor {
 impl RowFormatter for Row {
     /// Get Display reference for a given field.
     fn fmt(&self, i: usize) -> &dyn fmt::Display {
-        &self.fields[i].1
+        if let Some((_, v)) = self.fields.get(i) {
+            v
+        } else {
+            &"<IndexOutOfBound>"
+        }
     }
 }
 
 impl RowAccessor for Row {
+    fn is_null(&self, i: usize) -> Result<bool> {
+        match self.fields.get(i) {
+            Some((_, Field::Null)) => Ok(true),
+            None => Err(ParquetError::IndexOutOfBound(i, self.len())),
+            _ => Ok(false),
+        }
+    }
+
     row_primitive_accessor!(get_bool, Bool, bool);
 
     row_primitive_accessor!(get_byte, Byte, i8);
@@ -215,13 +282,15 @@ impl RowAccessor for Row {
 
     row_primitive_accessor!(get_ulong, ULong, u64);
 
+    row_primitive_accessor!(get_float16, Float16, f16);
+
     row_primitive_accessor!(get_float, Float, f32);
 
     row_primitive_accessor!(get_double, Double, f64);
 
-    row_primitive_accessor!(get_timestamp_millis, TimestampMillis, u64);
+    row_primitive_accessor!(get_timestamp_millis, TimestampMillis, i64);
 
-    row_primitive_accessor!(get_timestamp_micros, TimestampMicros, u64);
+    row_primitive_accessor!(get_timestamp_micros, TimestampMicros, i64);
 
     row_complex_accessor!(get_decimal, Decimal, Decimal);
 
@@ -236,16 +305,10 @@ impl RowAccessor for Row {
     row_complex_accessor!(get_map, MapInternal, Map);
 }
 
-/// Constructs a `Row` from the list of `fields` and returns it.
-#[inline]
-pub fn make_row(fields: Vec<(String, Field)>) -> Row {
-    Row { fields }
-}
-
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{{")?;
-        for (i, &(ref key, ref value)) in self.fields.iter().enumerate() {
+        for (i, (key, value)) in self.fields.iter().enumerate() {
             key.fmt(f)?;
             write!(f, ": ")?;
             value.fmt(f)?;
@@ -270,6 +333,7 @@ impl List {
         self.elements.len()
     }
 
+    /// Get the reference to the elements in this list
     pub fn elements(&self) -> &[Field] {
         self.elements.as_slice()
     }
@@ -284,24 +348,47 @@ pub fn make_list(elements: Vec<Field>) -> List {
 /// Trait for type-safe access of an index for a `List`.
 /// Note that the get_XXX methods do not do bound checking.
 pub trait ListAccessor {
+    /// Try getting a `boolean` value at the given index.
     fn get_bool(&self, i: usize) -> Result<bool>;
+    /// Try getting a `byte` value at the given index.
     fn get_byte(&self, i: usize) -> Result<i8>;
+    /// Try getting an `i16` value at the given index.
     fn get_short(&self, i: usize) -> Result<i16>;
+    /// Try getting an `i32` value at the given index.
     fn get_int(&self, i: usize) -> Result<i32>;
+    /// Try getting an `i64` value at the given index.
     fn get_long(&self, i: usize) -> Result<i64>;
+    /// Try getting a `u8` value at the given index.
     fn get_ubyte(&self, i: usize) -> Result<u8>;
+    /// Try getting a `u16` value at the given index.
     fn get_ushort(&self, i: usize) -> Result<u16>;
+    /// Try getting a `u32` value at the given index.
     fn get_uint(&self, i: usize) -> Result<u32>;
+    /// Try getting a `u64` value at the given index.
     fn get_ulong(&self, i: usize) -> Result<u64>;
+    /// Try getting a `f16` value at the given index.
+    fn get_float16(&self, i: usize) -> Result<f16>;
+    /// Try getting a `f32` value at the given index.
     fn get_float(&self, i: usize) -> Result<f32>;
+    /// Try getting a `f64` value at the given index.
     fn get_double(&self, i: usize) -> Result<f64>;
-    fn get_timestamp_millis(&self, i: usize) -> Result<u64>;
-    fn get_timestamp_micros(&self, i: usize) -> Result<u64>;
+    /// Try getting a `timestamp` as milliseconds value
+    /// encoded as `i64` at the given index.
+    fn get_timestamp_millis(&self, i: usize) -> Result<i64>;
+    /// Try getting a `timestamp` as microseconds value
+    /// encoded as `i64` at the given index.
+    fn get_timestamp_micros(&self, i: usize) -> Result<i64>;
+    /// Try getting a `decimal` value at the given index.
     fn get_decimal(&self, i: usize) -> Result<&Decimal>;
+    /// Try getting a `string` value at the given index.
     fn get_string(&self, i: usize) -> Result<&String>;
+    /// Try getting a `bytes` value at the given index.
     fn get_bytes(&self, i: usize) -> Result<&ByteArray>;
+    /// Try getting a `group` value at the given index.
     fn get_group(&self, i: usize) -> Result<&Row>;
+    /// Try getting a `list` value at the given index.
     fn get_list(&self, i: usize) -> Result<&List>;
+    /// Try getting a `map` value at the given index.
     fn get_map(&self, i: usize) -> Result<&Map>;
 }
 
@@ -327,8 +414,8 @@ macro_rules! list_primitive_accessor {
 macro_rules! list_complex_accessor {
     ($METHOD:ident, $VARIANT:ident, $TY:ty) => {
         fn $METHOD(&self, i: usize) -> Result<&$TY> {
-            match self.elements[i] {
-                Field::$VARIANT(ref v) => Ok(v),
+            match &self.elements[i] {
+                Field::$VARIANT(v) => Ok(&v),
                 _ => Err(general_err!(
                     "Cannot access {} as {}",
                     self.elements[i].get_type_name(),
@@ -358,13 +445,15 @@ impl ListAccessor for List {
 
     list_primitive_accessor!(get_ulong, ULong, u64);
 
+    list_primitive_accessor!(get_float16, Float16, f16);
+
     list_primitive_accessor!(get_float, Float, f32);
 
     list_primitive_accessor!(get_double, Double, f64);
 
-    list_primitive_accessor!(get_timestamp_millis, TimestampMillis, u64);
+    list_primitive_accessor!(get_timestamp_millis, TimestampMillis, i64);
 
-    list_primitive_accessor!(get_timestamp_micros, TimestampMicros, u64);
+    list_primitive_accessor!(get_timestamp_micros, TimestampMicros, i64);
 
     list_complex_accessor!(get_decimal, Decimal, Decimal);
 
@@ -392,6 +481,7 @@ impl Map {
         self.entries.len()
     }
 
+    /// Get the reference to the key-value pairs in this map
     pub fn entries(&self) -> &[(Field, Field)] {
         self.entries.as_slice()
     }
@@ -405,7 +495,9 @@ pub fn make_map(entries: Vec<(Field, Field)>) -> Map {
 
 /// Trait for type-safe access of an index for a `Map`
 pub trait MapAccessor {
+    /// Get the keys of the map.
     fn get_keys<'a>(&'a self) -> Box<dyn ListAccessor + 'a>;
+    /// Get the values of the map.
     fn get_values<'a>(&'a self) -> Box<dyn ListAccessor + 'a>;
 }
 
@@ -430,7 +522,7 @@ macro_rules! map_list_primitive_accessor {
     };
 }
 
-impl<'a> ListAccessor for MapList<'a> {
+impl ListAccessor for MapList<'_> {
     map_list_primitive_accessor!(get_bool, Bool, bool);
 
     map_list_primitive_accessor!(get_byte, Byte, i8);
@@ -449,13 +541,15 @@ impl<'a> ListAccessor for MapList<'a> {
 
     map_list_primitive_accessor!(get_ulong, ULong, u64);
 
+    map_list_primitive_accessor!(get_float16, Float16, f16);
+
     map_list_primitive_accessor!(get_float, Float, f32);
 
     map_list_primitive_accessor!(get_double, Double, f64);
 
-    map_list_primitive_accessor!(get_timestamp_millis, TimestampMillis, u64);
+    map_list_primitive_accessor!(get_timestamp_millis, TimestampMillis, i64);
 
-    map_list_primitive_accessor!(get_timestamp_micros, TimestampMicros, u64);
+    map_list_primitive_accessor!(get_timestamp_micros, TimestampMicros, i64);
 
     list_complex_accessor!(get_decimal, Decimal, Decimal);
 
@@ -502,14 +596,16 @@ pub enum Field {
     Int(i32),
     /// Signed integer INT_64.
     Long(i64),
-    // Unsigned integer UINT_8.
+    /// Unsigned integer UINT_8.
     UByte(u8),
-    // Unsigned integer UINT_16.
+    /// Unsigned integer UINT_16.
     UShort(u16),
-    // Unsigned integer UINT_32.
+    /// Unsigned integer UINT_32.
     UInt(u32),
-    // Unsigned integer UINT_64.
+    /// Unsigned integer UINT_64.
     ULong(u64),
+    /// IEEE 16-bit floating point value.
+    Float16(f16),
     /// IEEE 32-bit floating point value.
     Float(f32),
     /// IEEE 64-bit floating point value.
@@ -522,11 +618,17 @@ pub enum Field {
     Bytes(ByteArray),
     /// Date without a time of day, stores the number of days from the
     /// Unix epoch, 1 January 1970.
-    Date(u32),
+    Date(i32),
+
+    /// The total number of milliseconds since midnight.
+    TimeMillis(i32),
+    /// The total number of microseconds since midnight.
+    TimeMicros(i64),
+
     /// Milliseconds from the Unix epoch, 1 January 1970.
-    TimestampMillis(u64),
-    /// Microseconds from the Unix epoch, 1 Janiary 1970.
-    TimestampMicros(u64),
+    TimestampMillis(i64),
+    /// Microseconds from the Unix epoch, 1 January 1970.
+    TimestampMicros(i64),
 
     // ----------------------------------------------------------------------
     // Complex types
@@ -552,12 +654,15 @@ impl Field {
             Field::UShort(_) => "UShort",
             Field::UInt(_) => "UInt",
             Field::ULong(_) => "ULong",
+            Field::Float16(_) => "Float16",
             Field::Float(_) => "Float",
             Field::Double(_) => "Double",
             Field::Decimal(_) => "Decimal",
             Field::Date(_) => "Date",
             Field::Str(_) => "Str",
             Field::Bytes(_) => "Bytes",
+            Field::TimeMillis(_) => "TimeMillis",
+            Field::TimeMicros(_) => "TimeMicros",
             Field::TimestampMillis(_) => "TimestampMillis",
             Field::TimestampMicros(_) => "TimestampMicros",
             Field::Group(_) => "Group",
@@ -590,7 +695,8 @@ impl Field {
             ConvertedType::UINT_8 => Field::UByte(value as u8),
             ConvertedType::UINT_16 => Field::UShort(value as u16),
             ConvertedType::UINT_32 => Field::UInt(value as u32),
-            ConvertedType::DATE => Field::Date(value as u32),
+            ConvertedType::DATE => Field::Date(value),
+            ConvertedType::TIME_MILLIS => Field::TimeMillis(value),
             ConvertedType::DECIMAL => Field::Decimal(Decimal::from_i32(
                 value,
                 descr.type_precision(),
@@ -606,8 +712,9 @@ impl Field {
         match descr.converted_type() {
             ConvertedType::INT_64 | ConvertedType::NONE => Field::Long(value),
             ConvertedType::UINT_64 => Field::ULong(value as u64),
-            ConvertedType::TIMESTAMP_MILLIS => Field::TimestampMillis(value as u64),
-            ConvertedType::TIMESTAMP_MICROS => Field::TimestampMicros(value as u64),
+            ConvertedType::TIME_MICROS => Field::TimeMicros(value),
+            ConvertedType::TIMESTAMP_MILLIS => Field::TimestampMillis(value),
+            ConvertedType::TIMESTAMP_MICROS => Field::TimestampMicros(value),
             ConvertedType::DECIMAL => Field::Decimal(Decimal::from_i64(
                 value,
                 descr.type_precision(),
@@ -621,7 +728,7 @@ impl Field {
     /// `Timestamp` value.
     #[inline]
     pub fn convert_int96(_descr: &ColumnDescPtr, value: Int96) -> Self {
-        Field::TimestampMillis(value.to_i64() as u64)
+        Field::TimestampMillis(value.to_millis())
     }
 
     /// Converts Parquet FLOAT type with logical type into `f32` value.
@@ -636,14 +743,20 @@ impl Field {
         Field::Double(value)
     }
 
-    /// Converts Parquet BYTE_ARRAY type with converted type into either UTF8 string or
-    /// array of bytes.
+    /// Converts Parquet BYTE_ARRAY type with converted type into a UTF8
+    /// string, decimal, float16, or an array of bytes.
     #[inline]
-    pub fn convert_byte_array(descr: &ColumnDescPtr, value: ByteArray) -> Self {
-        match descr.physical_type() {
+    pub fn convert_byte_array(descr: &ColumnDescPtr, value: ByteArray) -> Result<Self> {
+        let field = match descr.physical_type() {
             PhysicalType::BYTE_ARRAY => match descr.converted_type() {
                 ConvertedType::UTF8 | ConvertedType::ENUM | ConvertedType::JSON => {
-                    let value = String::from_utf8(value.data().to_vec()).unwrap();
+                    let value = String::from_utf8(value.data().to_vec()).map_err(|e| {
+                        general_err!(
+                            "Error reading BYTE_ARRAY as String. Bytes: {:?} Error: {:?}",
+                            value.data(),
+                            e
+                        )
+                    })?;
                     Field::Str(value)
                 }
                 ConvertedType::BSON | ConvertedType::NONE => Field::Bytes(value),
@@ -660,15 +773,30 @@ impl Field {
                     descr.type_precision(),
                     descr.type_scale(),
                 )),
+                ConvertedType::NONE if descr.logical_type_ref() == Some(&LogicalType::Float16) => {
+                    if value.len() != 2 {
+                        return Err(general_err!(
+                            "Error reading FIXED_LEN_BYTE_ARRAY as FLOAT16. Length must be 2, got {}",
+                            value.len()
+                        ));
+                    }
+                    let bytes = [value.data()[0], value.data()[1]];
+                    Field::Float16(f16::from_le_bytes(bytes))
+                }
                 ConvertedType::NONE => Field::Bytes(value),
                 _ => nyi!(descr, value),
             },
             _ => nyi!(descr, value),
-        }
+        };
+        Ok(field)
     }
 
+    /// Converts the Parquet field into a JSON [`Value`].
     #[cfg(any(feature = "json", test))]
     pub fn to_json_value(&self) -> Value {
+        use base64::Engine;
+        use base64::prelude::BASE64_STANDARD;
+
         match &self {
             Field::Null => Value::Null,
             Field::Bool(b) => Value::Bool(*b),
@@ -680,6 +808,9 @@ impl Field {
             Field::UShort(n) => Value::Number(serde_json::Number::from(*n)),
             Field::UInt(n) => Value::Number(serde_json::Number::from(*n)),
             Field::ULong(n) => Value::Number(serde_json::Number::from(*n)),
+            Field::Float16(n) => serde_json::Number::from_f64(f64::from(*n))
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             Field::Float(n) => serde_json::Number::from_f64(f64::from(*n))
                 .map(Value::Number)
                 .unwrap_or(Value::Null),
@@ -688,14 +819,12 @@ impl Field {
                 .unwrap_or(Value::Null),
             Field::Decimal(n) => Value::String(convert_decimal_to_string(n)),
             Field::Str(s) => Value::String(s.to_owned()),
-            Field::Bytes(b) => Value::String(base64::encode(b.data())),
+            Field::Bytes(b) => Value::String(BASE64_STANDARD.encode(b.data())),
             Field::Date(d) => Value::String(convert_date_to_string(*d)),
-            Field::TimestampMillis(ts) => {
-                Value::String(convert_timestamp_millis_to_string(*ts))
-            }
-            Field::TimestampMicros(ts) => {
-                Value::String(convert_timestamp_micros_to_string(*ts))
-            }
+            Field::TimeMillis(t) => Value::String(convert_time_millis_to_string(*t)),
+            Field::TimeMicros(t) => Value::String(convert_time_micros_to_string(*t)),
+            Field::TimestampMillis(ts) => Value::String(convert_timestamp_millis_to_string(*ts)),
+            Field::TimestampMicros(ts) => Value::String(convert_timestamp_micros_to_string(*ts)),
             Field::Group(row) => row.to_json_value(),
             Field::ListInternal(fields) => {
                 Value::Array(fields.elements.iter().map(|f| f.to_json_value()).collect())
@@ -721,46 +850,61 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Field::Null => write!(f, "null"),
-            Field::Bool(value) => write!(f, "{}", value),
-            Field::Byte(value) => write!(f, "{}", value),
-            Field::Short(value) => write!(f, "{}", value),
-            Field::Int(value) => write!(f, "{}", value),
-            Field::Long(value) => write!(f, "{}", value),
-            Field::UByte(value) => write!(f, "{}", value),
-            Field::UShort(value) => write!(f, "{}", value),
-            Field::UInt(value) => write!(f, "{}", value),
-            Field::ULong(value) => write!(f, "{}", value),
+            Field::Bool(value) => write!(f, "{value}"),
+            Field::Byte(value) => write!(f, "{value}"),
+            Field::Short(value) => write!(f, "{value}"),
+            Field::Int(value) => write!(f, "{value}"),
+            Field::Long(value) => write!(f, "{value}"),
+            Field::UByte(value) => write!(f, "{value}"),
+            Field::UShort(value) => write!(f, "{value}"),
+            Field::UInt(value) => write!(f, "{value}"),
+            Field::ULong(value) => write!(f, "{value}"),
+            Field::Float16(value) => {
+                if !value.is_finite() {
+                    write!(f, "{value}")
+                } else if value.trunc() == value {
+                    write!(f, "{value}.0")
+                } else {
+                    write!(f, "{value}")
+                }
+            }
             Field::Float(value) => {
                 if !(1e-15..=1e19).contains(&value) {
-                    write!(f, "{:E}", value)
+                    write!(f, "{value:E}")
                 } else if value.trunc() == value {
-                    write!(f, "{}.0", value)
+                    write!(f, "{value}.0")
                 } else {
-                    write!(f, "{}", value)
+                    write!(f, "{value}")
                 }
             }
             Field::Double(value) => {
                 if !(1e-15..=1e19).contains(&value) {
-                    write!(f, "{:E}", value)
+                    write!(f, "{value:E}")
                 } else if value.trunc() == value {
-                    write!(f, "{}.0", value)
+                    write!(f, "{value}.0")
                 } else {
-                    write!(f, "{}", value)
+                    write!(f, "{value}")
                 }
             }
             Field::Decimal(ref value) => {
                 write!(f, "{}", convert_decimal_to_string(value))
             }
-            Field::Str(ref value) => write!(f, "\"{}\"", value),
+            Field::Str(ref value) => write!(f, "\"{value}\""),
             Field::Bytes(ref value) => write!(f, "{:?}", value.data()),
             Field::Date(value) => write!(f, "{}", convert_date_to_string(value)),
+            Field::TimeMillis(value) => {
+                write!(f, "{}", convert_time_millis_to_string(value))
+            }
+            Field::TimeMicros(value) => {
+                write!(f, "{}", convert_time_micros_to_string(value))
+            }
             Field::TimestampMillis(value) => {
                 write!(f, "{}", convert_timestamp_millis_to_string(value))
             }
             Field::TimestampMicros(value) => {
                 write!(f, "{}", convert_timestamp_micros_to_string(value))
             }
-            Field::Group(ref fields) => write!(f, "{}", fields),
+            Field::Group(ref fields) => write!(f, "{fields}"),
             Field::ListInternal(ref list) => {
                 let elems = &list.elements;
                 write!(f, "[")?;
@@ -775,7 +919,7 @@ impl fmt::Display for Field {
             Field::MapInternal(ref map) => {
                 let entries = &map.entries;
                 write!(f, "{{")?;
-                for (i, &(ref key, ref value)) in entries.iter().enumerate() {
+                for (i, (key, value)) in entries.iter().enumerate() {
                     key.fmt(f)?;
                     write!(f, " -> ")?;
                     value.fmt(f)?;
@@ -793,27 +937,56 @@ impl fmt::Display for Field {
 /// Input `value` is a number of days since the epoch in UTC.
 /// Date is displayed in local timezone.
 #[inline]
-fn convert_date_to_string(value: u32) -> String {
+fn convert_date_to_string(value: i32) -> String {
     static NUM_SECONDS_IN_DAY: i64 = 60 * 60 * 24;
-    let dt = Utc.timestamp(value as i64 * NUM_SECONDS_IN_DAY, 0).date();
-    format!("{}", dt.format("%Y-%m-%d %:z"))
+    let dt = Utc
+        .timestamp_opt(value as i64 * NUM_SECONDS_IN_DAY, 0)
+        .unwrap();
+    format!("{}", dt.format("%Y-%m-%d"))
 }
 
 /// Helper method to convert Parquet timestamp into a string.
 /// Input `value` is a number of milliseconds since the epoch in UTC.
-/// Datetime is displayed in local timezone.
+/// Datetime is displayed in UTC timezone.
 #[inline]
-fn convert_timestamp_millis_to_string(value: u64) -> String {
-    let dt = Utc.timestamp((value / 1000) as i64, 0);
-    format!("{}", dt.format("%Y-%m-%d %H:%M:%S %:z"))
+fn convert_timestamp_millis_to_string(value: i64) -> String {
+    let dt = Utc.timestamp_millis_opt(value).unwrap();
+    format!("{}", dt.format("%Y-%m-%d %H:%M:%S%.3f %:z"))
 }
 
 /// Helper method to convert Parquet timestamp into a string.
 /// Input `value` is a number of microseconds since the epoch in UTC.
-/// Datetime is displayed in local timezone.
+/// Datetime is displayed in UTC timezone.
 #[inline]
-fn convert_timestamp_micros_to_string(value: u64) -> String {
-    convert_timestamp_millis_to_string(value / 1000)
+fn convert_timestamp_micros_to_string(value: i64) -> String {
+    let dt = Utc.timestamp_micros(value).unwrap();
+    format!("{}", dt.format("%Y-%m-%d %H:%M:%S%.6f %:z"))
+}
+
+/// Helper method to convert Parquet time (milliseconds since midnight) into a string.
+/// Input `value` is a number of milliseconds since midnight.
+/// Time is displayed in HH:MM:SS.sss format.
+#[inline]
+fn convert_time_millis_to_string(value: i32) -> String {
+    let total_ms = value as u64;
+    let hours = total_ms / (60 * 60 * 1000);
+    let minutes = (total_ms % (60 * 60 * 1000)) / (60 * 1000);
+    let seconds = (total_ms % (60 * 1000)) / 1000;
+    let millis = total_ms % 1000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+/// Helper method to convert Parquet time (microseconds since midnight) into a string.
+/// Input `value` is a number of microseconds since midnight.
+/// Time is displayed in HH:MM:SS.ssssss format.
+#[inline]
+fn convert_time_micros_to_string(value: i64) -> String {
+    let total_us = value as u64;
+    let hours = total_us / (60 * 60 * 1000 * 1000);
+    let minutes = (total_us % (60 * 60 * 1000 * 1000)) / (60 * 1000 * 1000);
+    let seconds = (total_us % (60 * 1000 * 1000)) / (1000 * 1000);
+    let micros = total_us % (1000 * 1000);
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
 }
 
 /// Helper method to convert Parquet decimal into a string.
@@ -827,7 +1000,7 @@ fn convert_decimal_to_string(decimal: &Decimal) -> String {
     let num = BigInt::from_signed_bytes_be(decimal.data());
 
     // Offset of the first digit in a string.
-    let negative = if num.sign() == Sign::Minus { 1 } else { 0 };
+    let negative = i32::from(num.sign() == Sign::Minus);
     let mut num_str = num.to_string();
     let mut point = num_str.len() as i32 - decimal.scale() - negative;
 
@@ -849,10 +1022,11 @@ fn convert_decimal_to_string(decimal: &Decimal) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::approx_constant, clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names)]
 mod tests {
     use super::*;
 
+    use std::f64::consts::PI;
     use std::sync::Arc;
 
     use crate::schema::types::{ColumnDescriptor, ColumnPath, PrimitiveTypeBuilder};
@@ -934,8 +1108,11 @@ mod tests {
         let row = Field::convert_int32(&descr, 14611);
         assert_eq!(row, Field::Date(14611));
 
-        let descr =
-            make_column_descr![PhysicalType::INT32, ConvertedType::DECIMAL, 0, 8, 2];
+        let descr = make_column_descr![PhysicalType::INT32, ConvertedType::TIME_MILLIS];
+        let row = Field::convert_int32(&descr, 14611);
+        assert_eq!(row, Field::TimeMillis(14611));
+
+        let descr = make_column_descr![PhysicalType::INT32, ConvertedType::DECIMAL, 0, 8, 2];
         let row = Field::convert_int32(&descr, 444);
         assert_eq!(row, Field::Decimal(Decimal::from_i32(444, 8, 2)));
     }
@@ -950,22 +1127,23 @@ mod tests {
         let row = Field::convert_int64(&descr, 78239823);
         assert_eq!(row, Field::ULong(78239823));
 
-        let descr =
-            make_column_descr![PhysicalType::INT64, ConvertedType::TIMESTAMP_MILLIS];
+        let descr = make_column_descr![PhysicalType::INT64, ConvertedType::TIMESTAMP_MILLIS];
         let row = Field::convert_int64(&descr, 1541186529153);
         assert_eq!(row, Field::TimestampMillis(1541186529153));
 
-        let descr =
-            make_column_descr![PhysicalType::INT64, ConvertedType::TIMESTAMP_MICROS];
+        let descr = make_column_descr![PhysicalType::INT64, ConvertedType::TIMESTAMP_MICROS];
         let row = Field::convert_int64(&descr, 1541186529153123);
         assert_eq!(row, Field::TimestampMicros(1541186529153123));
+
+        let descr = make_column_descr![PhysicalType::INT64, ConvertedType::TIME_MICROS];
+        let row = Field::convert_int64(&descr, 47445123456);
+        assert_eq!(row, Field::TimeMicros(47445123456));
 
         let descr = make_column_descr![PhysicalType::INT64, ConvertedType::NONE];
         let row = Field::convert_int64(&descr, 2222);
         assert_eq!(row, Field::Long(2222));
 
-        let descr =
-            make_column_descr![PhysicalType::INT64, ConvertedType::DECIMAL, 0, 8, 2];
+        let descr = make_column_descr![PhysicalType::INT64, ConvertedType::DECIMAL, 0, 8, 2];
         let row = Field::convert_int64(&descr, 3333);
         assert_eq!(row, Field::Decimal(Decimal::from_i64(3333, 8, 2)));
     }
@@ -1006,38 +1184,40 @@ mod tests {
         let descr = make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::UTF8];
         let value = ByteArray::from(vec![b'A', b'B', b'C', b'D']);
         let row = Field::convert_byte_array(&descr, value);
-        assert_eq!(row, Field::Str("ABCD".to_string()));
+        assert_eq!(row.unwrap(), Field::Str("ABCD".to_string()));
 
         // ENUM
         let descr = make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::ENUM];
         let value = ByteArray::from(vec![b'1', b'2', b'3']);
         let row = Field::convert_byte_array(&descr, value);
-        assert_eq!(row, Field::Str("123".to_string()));
+        assert_eq!(row.unwrap(), Field::Str("123".to_string()));
 
         // JSON
         let descr = make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::JSON];
         let value = ByteArray::from(vec![b'{', b'"', b'a', b'"', b':', b'1', b'}']);
         let row = Field::convert_byte_array(&descr, value);
-        assert_eq!(row, Field::Str("{\"a\":1}".to_string()));
+        assert_eq!(row.unwrap(), Field::Str("{\"a\":1}".to_string()));
 
         // NONE
         let descr = make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::NONE];
         let value = ByteArray::from(vec![1, 2, 3, 4, 5]);
         let row = Field::convert_byte_array(&descr, value.clone());
-        assert_eq!(row, Field::Bytes(value));
+        assert_eq!(row.unwrap(), Field::Bytes(value));
 
         // BSON
         let descr = make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::BSON];
         let value = ByteArray::from(vec![1, 2, 3, 4, 5]);
         let row = Field::convert_byte_array(&descr, value.clone());
-        assert_eq!(row, Field::Bytes(value));
+        assert_eq!(row.unwrap(), Field::Bytes(value));
 
         // DECIMAL
-        let descr =
-            make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::DECIMAL, 0, 8, 2];
+        let descr = make_column_descr![PhysicalType::BYTE_ARRAY, ConvertedType::DECIMAL, 0, 8, 2];
         let value = ByteArray::from(vec![207, 200]);
         let row = Field::convert_byte_array(&descr, value.clone());
-        assert_eq!(row, Field::Decimal(Decimal::from_bytes(value, 8, 2)));
+        assert_eq!(
+            row.unwrap(),
+            Field::Decimal(Decimal::from_bytes(value, 8, 2))
+        );
 
         // DECIMAL (FIXED_LEN_BYTE_ARRAY)
         let descr = make_column_descr![
@@ -1049,7 +1229,28 @@ mod tests {
         ];
         let value = ByteArray::from(vec![0, 0, 0, 0, 0, 4, 147, 224]);
         let row = Field::convert_byte_array(&descr, value.clone());
-        assert_eq!(row, Field::Decimal(Decimal::from_bytes(value, 17, 5)));
+        assert_eq!(
+            row.unwrap(),
+            Field::Decimal(Decimal::from_bytes(value, 17, 5))
+        );
+
+        // FLOAT16
+        let descr = {
+            let tpe = PrimitiveTypeBuilder::new("col", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+                .with_logical_type(Some(LogicalType::Float16))
+                .with_length(2)
+                .build()
+                .unwrap();
+            Arc::new(ColumnDescriptor::new(
+                Arc::new(tpe),
+                0,
+                0,
+                ColumnPath::from("col"),
+            ))
+        };
+        let value = ByteArray::from(f16::PI);
+        let row = Field::convert_byte_array(&descr, value.clone());
+        assert_eq!(row.unwrap(), Field::Float16(f16::PI));
 
         // NONE (FIXED_LEN_BYTE_ARRAY)
         let descr = make_column_descr![
@@ -1061,19 +1262,23 @@ mod tests {
         ];
         let value = ByteArray::from(vec![1, 2, 3, 4, 5, 6]);
         let row = Field::convert_byte_array(&descr, value.clone());
-        assert_eq!(row, Field::Bytes(value));
+        assert_eq!(row.unwrap(), Field::Bytes(value));
     }
 
     #[test]
     fn test_convert_date_to_string() {
         fn check_date_conversion(y: u32, m: u32, d: u32) {
-            let datetime = chrono::NaiveDate::from_ymd(y as i32, m, d).and_hms(0, 0, 0);
+            let datetime = chrono::NaiveDate::from_ymd_opt(y as i32, m, d)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
             let dt = Utc.from_utc_datetime(&datetime);
-            let res = convert_date_to_string((dt.timestamp() / 60 / 60 / 24) as u32);
-            let exp = format!("{}", dt.format("%Y-%m-%d %:z"));
+            let res = convert_date_to_string((dt.timestamp() / 60 / 60 / 24) as i32);
+            let exp = format!("{}", dt.format("%Y-%m-%d"));
             assert_eq!(res, exp);
         }
 
+        check_date_conversion(1969, 12, 31);
         check_date_conversion(2010, 1, 2);
         check_date_conversion(2014, 5, 1);
         check_date_conversion(2016, 2, 29);
@@ -1082,20 +1287,88 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_timestamp_to_string() {
-        fn check_datetime_conversion(y: u32, m: u32, d: u32, h: u32, mi: u32, s: u32) {
-            let datetime = chrono::NaiveDate::from_ymd(y as i32, m, d).and_hms(h, mi, s);
+    fn test_convert_timestamp_millis_to_string() {
+        fn check_datetime_conversion(
+            (y, m, d, h, mi, s, milli): (u32, u32, u32, u32, u32, u32, u32),
+            exp: &str,
+        ) {
+            let datetime = chrono::NaiveDate::from_ymd_opt(y as i32, m, d)
+                .unwrap()
+                .and_hms_milli_opt(h, mi, s, milli)
+                .unwrap();
             let dt = Utc.from_utc_datetime(&datetime);
-            let res = convert_timestamp_millis_to_string(dt.timestamp_millis() as u64);
-            let exp = format!("{}", dt.format("%Y-%m-%d %H:%M:%S %:z"));
+            let res = convert_timestamp_millis_to_string(dt.timestamp_millis());
             assert_eq!(res, exp);
         }
 
-        check_datetime_conversion(2010, 1, 2, 13, 12, 54);
-        check_datetime_conversion(2011, 1, 3, 8, 23, 1);
-        check_datetime_conversion(2012, 4, 5, 11, 6, 32);
-        check_datetime_conversion(2013, 5, 12, 16, 38, 0);
-        check_datetime_conversion(2014, 11, 28, 21, 15, 12);
+        check_datetime_conversion((1969, 9, 10, 1, 2, 3, 4), "1969-09-10 01:02:03.004 +00:00");
+        check_datetime_conversion(
+            (2010, 1, 2, 13, 12, 54, 42),
+            "2010-01-02 13:12:54.042 +00:00",
+        );
+        check_datetime_conversion((2011, 1, 3, 8, 23, 1, 27), "2011-01-03 08:23:01.027 +00:00");
+        check_datetime_conversion((2012, 4, 5, 11, 6, 32, 0), "2012-04-05 11:06:32.000 +00:00");
+        check_datetime_conversion(
+            (2013, 5, 12, 16, 38, 0, 15),
+            "2013-05-12 16:38:00.015 +00:00",
+        );
+        check_datetime_conversion(
+            (2014, 11, 28, 21, 15, 12, 59),
+            "2014-11-28 21:15:12.059 +00:00",
+        );
+    }
+
+    #[test]
+    fn test_convert_timestamp_micros_to_string() {
+        fn check_datetime_conversion(
+            (y, m, d, h, mi, s, micro): (u32, u32, u32, u32, u32, u32, u32),
+            exp: &str,
+        ) {
+            let datetime = chrono::NaiveDate::from_ymd_opt(y as i32, m, d)
+                .unwrap()
+                .and_hms_micro_opt(h, mi, s, micro)
+                .unwrap();
+            let dt = Utc.from_utc_datetime(&datetime);
+            let res = convert_timestamp_micros_to_string(dt.timestamp_micros());
+            assert_eq!(res, exp);
+        }
+
+        check_datetime_conversion(
+            (1969, 9, 10, 1, 2, 3, 4),
+            "1969-09-10 01:02:03.000004 +00:00",
+        );
+        check_datetime_conversion(
+            (2010, 1, 2, 13, 12, 54, 42),
+            "2010-01-02 13:12:54.000042 +00:00",
+        );
+        check_datetime_conversion(
+            (2011, 1, 3, 8, 23, 1, 27),
+            "2011-01-03 08:23:01.000027 +00:00",
+        );
+        check_datetime_conversion(
+            (2012, 4, 5, 11, 6, 32, 0),
+            "2012-04-05 11:06:32.000000 +00:00",
+        );
+        check_datetime_conversion(
+            (2013, 5, 12, 16, 38, 0, 15),
+            "2013-05-12 16:38:00.000015 +00:00",
+        );
+        check_datetime_conversion(
+            (2014, 11, 28, 21, 15, 12, 59),
+            "2014-11-28 21:15:12.000059 +00:00",
+        );
+    }
+
+    #[test]
+    fn test_convert_float16_to_string() {
+        assert_eq!(format!("{}", Field::Float16(f16::ONE)), "1.0");
+        assert_eq!(format!("{}", Field::Float16(f16::PI)), "3.140625");
+        assert_eq!(format!("{}", Field::Float16(f16::MAX)), "65504.0");
+        assert_eq!(format!("{}", Field::Float16(f16::NAN)), "NaN");
+        assert_eq!(format!("{}", Field::Float16(f16::INFINITY)), "inf");
+        assert_eq!(format!("{}", Field::Float16(f16::NEG_INFINITY)), "-inf");
+        assert_eq!(format!("{}", Field::Float16(f16::ZERO)), "0.0");
+        assert_eq!(format!("{}", Field::Float16(f16::NEG_ZERO)), "-0.0");
     }
 
     #[test]
@@ -1171,6 +1444,7 @@ mod tests {
         assert_eq!(format!("{}", Field::UShort(2)), "2");
         assert_eq!(format!("{}", Field::UInt(3)), "3");
         assert_eq!(format!("{}", Field::ULong(4)), "4");
+        assert_eq!(format!("{}", Field::Float16(f16::E)), "2.71875");
         assert_eq!(format!("{}", Field::Float(5.0)), "5.0");
         assert_eq!(format!("{}", Field::Float(5.1234)), "5.1234");
         assert_eq!(format!("{}", Field::Double(6.0)), "6.0");
@@ -1204,8 +1478,8 @@ mod tests {
             ("z".to_string(), Field::Float(3.1)),
             ("a".to_string(), Field::Str("abc".to_string())),
         ];
-        let row = Field::Group(make_row(fields));
-        assert_eq!(format!("{}", row), "{x: null, Y: 2, z: 3.1, a: \"abc\"}");
+        let row = Field::Group(Row::new(fields));
+        assert_eq!(format!("{row}"), "{x: null, Y: 2, z: 3.1, a: \"abc\"}");
 
         let row = Field::ListInternal(make_list(vec![
             Field::Int(2),
@@ -1213,14 +1487,14 @@ mod tests {
             Field::Null,
             Field::Int(12),
         ]));
-        assert_eq!(format!("{}", row), "[2, 1, null, 12]");
+        assert_eq!(format!("{row}"), "[2, 1, null, 12]");
 
         let row = Field::MapInternal(make_map(vec![
             (Field::Int(1), Field::Float(1.2)),
             (Field::Int(2), Field::Float(4.5)),
             (Field::Int(3), Field::Float(2.3)),
         ]));
-        assert_eq!(format!("{}", row), "{1 -> 1.2, 2 -> 4.5, 3 -> 2.3}");
+        assert_eq!(format!("{row}"), "{1 -> 1.2, 2 -> 4.5, 3 -> 2.3}");
     }
 
     #[test]
@@ -1237,6 +1511,7 @@ mod tests {
         assert!(Field::UShort(2).is_primitive());
         assert!(Field::UInt(3).is_primitive());
         assert!(Field::ULong(4).is_primitive());
+        assert!(Field::Float16(f16::E).is_primitive());
         assert!(Field::Float(5.0).is_primitive());
         assert!(Field::Float(5.1234).is_primitive());
         assert!(Field::Double(6.0).is_primitive());
@@ -1248,34 +1523,40 @@ mod tests {
         assert!(Field::Decimal(Decimal::from_i32(4, 8, 2)).is_primitive());
 
         // complex types
-        assert!(!Field::Group(make_row(vec![
-            ("x".to_string(), Field::Null),
-            ("Y".to_string(), Field::Int(2)),
-            ("z".to_string(), Field::Float(3.1)),
-            ("a".to_string(), Field::Str("abc".to_string()))
-        ]))
-        .is_primitive());
+        assert!(
+            !Field::Group(Row::new(vec![
+                ("x".to_string(), Field::Null),
+                ("Y".to_string(), Field::Int(2)),
+                ("z".to_string(), Field::Float(3.1)),
+                ("a".to_string(), Field::Str("abc".to_string()))
+            ]))
+            .is_primitive()
+        );
 
-        assert!(!Field::ListInternal(make_list(vec![
-            Field::Int(2),
-            Field::Int(1),
-            Field::Null,
-            Field::Int(12)
-        ]))
-        .is_primitive());
+        assert!(
+            !Field::ListInternal(make_list(vec![
+                Field::Int(2),
+                Field::Int(1),
+                Field::Null,
+                Field::Int(12)
+            ]))
+            .is_primitive()
+        );
 
-        assert!(!Field::MapInternal(make_map(vec![
-            (Field::Int(1), Field::Float(1.2)),
-            (Field::Int(2), Field::Float(4.5)),
-            (Field::Int(3), Field::Float(2.3))
-        ]))
-        .is_primitive());
+        assert!(
+            !Field::MapInternal(make_map(vec![
+                (Field::Int(1), Field::Float(1.2)),
+                (Field::Int(2), Field::Float(4.5)),
+                (Field::Int(3), Field::Float(2.3))
+            ]))
+            .is_primitive()
+        );
     }
 
     #[test]
     fn test_row_primitive_field_fmt() {
         // Primitives types
-        let row = make_row(vec![
+        let row = Row::new(vec![
             ("00".to_string(), Field::Null),
             ("01".to_string(), Field::Bool(false)),
             ("02".to_string(), Field::Byte(3)),
@@ -1297,6 +1578,7 @@ mod tests {
             ("15".to_string(), Field::TimestampMillis(1262391174000)),
             ("16".to_string(), Field::TimestampMicros(1262391174000000)),
             ("17".to_string(), Field::Decimal(Decimal::from_i32(4, 7, 2))),
+            ("18".to_string(), Field::Float16(f16::PI)),
         ]);
 
         assert_eq!("null", format!("{}", row.fmt(0)));
@@ -1323,15 +1605,16 @@ mod tests {
             format!("{}", row.fmt(16))
         );
         assert_eq!("0.04", format!("{}", row.fmt(17)));
+        assert_eq!("3.140625", format!("{}", row.fmt(18)));
     }
 
     #[test]
     fn test_row_complex_field_fmt() {
         // Complex types
-        let row = make_row(vec![
+        let row = Row::new(vec![
             (
                 "00".to_string(),
-                Field::Group(make_row(vec![
+                Field::Group(Row::new(vec![
                     ("x".to_string(), Field::Null),
                     ("Y".to_string(), Field::Int(2)),
                 ])),
@@ -1363,7 +1646,7 @@ mod tests {
     #[test]
     fn test_row_primitive_accessors() {
         // primitives
-        let row = make_row(vec![
+        let row = Row::new(vec![
             ("a".to_string(), Field::Null),
             ("b".to_string(), Field::Bool(false)),
             ("c".to_string(), Field::Byte(3)),
@@ -1382,8 +1665,11 @@ mod tests {
                 Field::Bytes(ByteArray::from(vec![1, 2, 3, 4, 5])),
             ),
             ("o".to_string(), Field::Decimal(Decimal::from_i32(4, 7, 2))),
+            ("p".to_string(), Field::Float16(f16::from_f32(9.1))),
         ]);
 
+        assert!(row.is_null(0).unwrap());
+        assert!(!row.is_null(1).unwrap());
         assert!(!row.get_bool(1).unwrap());
         assert_eq!(3, row.get_byte(2).unwrap());
         assert_eq!(4, row.get_short(3).unwrap());
@@ -1398,12 +1684,78 @@ mod tests {
         assert_eq!("abc", row.get_string(12).unwrap());
         assert_eq!(5, row.get_bytes(13).unwrap().len());
         assert_eq!(7, row.get_decimal(14).unwrap().precision());
+        assert!((f16::from_f32(9.1) - row.get_float16(15).unwrap()).abs() < f16::EPSILON);
+
+        assert!(matches!(
+            row.is_null(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_bool(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_byte(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_short(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_int(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_long(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_ubyte(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_ushort(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_uint(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_ulong(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_float(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_double(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_string(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_bytes(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_decimal(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_float16(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
     }
 
     #[test]
     fn test_row_primitive_invalid_accessors() {
         // primitives
-        let row = make_row(vec![
+        let row = Row::new(vec![
             ("a".to_string(), Field::Null),
             ("b".to_string(), Field::Bool(false)),
             ("c".to_string(), Field::Byte(3)),
@@ -1422,6 +1774,7 @@ mod tests {
                 Field::Bytes(ByteArray::from(vec![1, 2, 3, 4, 5])),
             ),
             ("o".to_string(), Field::Decimal(Decimal::from_i32(4, 7, 2))),
+            ("p".to_string(), Field::Float16(f16::from_f32(9.1))),
         ]);
 
         for i in 0..row.len() {
@@ -1431,10 +1784,10 @@ mod tests {
 
     #[test]
     fn test_row_complex_accessors() {
-        let row = make_row(vec![
+        let row = Row::new(vec![
             (
                 "a".to_string(),
-                Field::Group(make_row(vec![
+                Field::Group(Row::new(vec![
                     ("x".to_string(), Field::Null),
                     ("Y".to_string(), Field::Int(2)),
                 ])),
@@ -1465,10 +1818,10 @@ mod tests {
 
     #[test]
     fn test_row_complex_invalid_accessors() {
-        let row = make_row(vec![
+        let row = Row::new(vec![
             (
                 "a".to_string(),
-                Field::Group(make_row(vec![
+                Field::Group(Row::new(vec![
                     ("x".to_string(), Field::Null),
                     ("Y".to_string(), Field::Int(2)),
                 ])),
@@ -1493,16 +1846,16 @@ mod tests {
         ]);
 
         assert_eq!(
-            ParquetError::General("Cannot access Group as Float".to_string()),
-            row.get_float(0).unwrap_err()
+            row.get_float(0).unwrap_err().to_string(),
+            "Parquet error: Cannot access Group as Float"
         );
         assert_eq!(
-            ParquetError::General("Cannot access ListInternal as Float".to_string()),
-            row.get_float(1).unwrap_err()
+            row.get_float(1).unwrap_err().to_string(),
+            "Parquet error: Cannot access ListInternal as Float"
         );
         assert_eq!(
-            ParquetError::General("Cannot access MapInternal as Float".to_string()),
-            row.get_float(2).unwrap_err()
+            row.get_float(2).unwrap_err().to_string(),
+            "Parquet error: Cannot access MapInternal as Float",
         );
     }
 
@@ -1536,6 +1889,9 @@ mod tests {
         let list = make_list(vec![Field::ULong(6), Field::ULong(7)]);
         assert_eq!(7, list.get_ulong(1).unwrap());
 
+        let list = make_list(vec![Field::Float16(f16::PI)]);
+        assert!((f16::PI - list.get_float16(0).unwrap()).abs() < f16::EPSILON);
+
         let list = make_list(vec![
             Field::Float(8.1),
             Field::Float(9.2),
@@ -1543,8 +1899,8 @@ mod tests {
         ]);
         assert!((10.3 - list.get_float(2).unwrap()).abs() < f32::EPSILON);
 
-        let list = make_list(vec![Field::Double(3.1415)]);
-        assert!((3.1415 - list.get_double(0).unwrap()).abs() < f64::EPSILON);
+        let list = make_list(vec![Field::Double(PI)]);
+        assert!((PI - list.get_double(0).unwrap()).abs() < f64::EPSILON);
 
         let list = make_list(vec![Field::Str("abc".to_string())]);
         assert_eq!(&"abc".to_string(), list.get_string(0).unwrap());
@@ -1586,6 +1942,9 @@ mod tests {
         let list = make_list(vec![Field::ULong(6), Field::ULong(7)]);
         assert!(list.get_float(1).is_err());
 
+        let list = make_list(vec![Field::Float16(f16::PI)]);
+        assert!(list.get_string(0).is_err());
+
         let list = make_list(vec![
             Field::Float(8.1),
             Field::Float(9.2),
@@ -1593,7 +1952,7 @@ mod tests {
         ]);
         assert!(list.get_double(2).is_err());
 
-        let list = make_list(vec![Field::Double(3.1415)]);
+        let list = make_list(vec![Field::Double(PI)]);
         assert!(list.get_string(0).is_err());
 
         let list = make_list(vec![Field::Str("abc".to_string())]);
@@ -1608,7 +1967,7 @@ mod tests {
 
     #[test]
     fn test_list_complex_accessors() {
-        let list = make_list(vec![Field::Group(make_row(vec![
+        let list = make_list(vec![Field::Group(Row::new(vec![
             ("x".to_string(), Field::Null),
             ("Y".to_string(), Field::Int(2)),
         ]))]);
@@ -1632,13 +1991,13 @@ mod tests {
 
     #[test]
     fn test_list_complex_invalid_accessors() {
-        let list = make_list(vec![Field::Group(make_row(vec![
+        let list = make_list(vec![Field::Group(Row::new(vec![
             ("x".to_string(), Field::Null),
             ("Y".to_string(), Field::Int(2)),
         ]))]);
         assert_eq!(
-            general_err!("Cannot access Group as Float".to_string()),
-            list.get_float(0).unwrap_err()
+            list.get_float(0).unwrap_err().to_string(),
+            "Parquet error: Cannot access Group as Float"
         );
 
         let list = make_list(vec![Field::ListInternal(make_list(vec![
@@ -1648,8 +2007,8 @@ mod tests {
             Field::Int(12),
         ]))]);
         assert_eq!(
-            general_err!("Cannot access ListInternal as Float".to_string()),
-            list.get_float(0).unwrap_err()
+            list.get_float(0).unwrap_err().to_string(),
+            "Parquet error: Cannot access ListInternal as Float"
         );
 
         let list = make_list(vec![Field::MapInternal(make_map(vec![
@@ -1658,8 +2017,8 @@ mod tests {
             (Field::Int(3), Field::Float(2.3)),
         ]))]);
         assert_eq!(
-            general_err!("Cannot access MapInternal as Float".to_string()),
-            list.get_float(0).unwrap_err()
+            list.get_float(0).unwrap_err().to_string(),
+            "Parquet error: Cannot access MapInternal as Float",
         );
     }
 
@@ -1722,6 +2081,10 @@ mod tests {
             Value::Number(serde_json::Number::from(4))
         );
         assert_eq!(
+            Field::Float16(f16::from_f32(5.0)).to_json_value(),
+            Value::Number(serde_json::Number::from_f64(5.0).unwrap())
+        );
+        assert_eq!(
             Field::Float(5.0).to_json_value(),
             Value::Number(serde_json::Number::from_f64(5.0).unwrap())
         );
@@ -1751,11 +2114,19 @@ mod tests {
         );
         assert_eq!(
             Field::TimestampMillis(12345678).to_json_value(),
-            Value::String("1970-01-01 03:25:45 +00:00".to_string())
+            Value::String("1970-01-01 03:25:45.678 +00:00".to_string())
         );
         assert_eq!(
             Field::TimestampMicros(12345678901).to_json_value(),
-            Value::String(convert_timestamp_micros_to_string(12345678901))
+            Value::String("1970-01-01 03:25:45.678901 +00:00".to_string())
+        );
+        assert_eq!(
+            Field::TimeMillis(47445123).to_json_value(),
+            Value::String(String::from("13:10:45.123"))
+        );
+        assert_eq!(
+            Field::TimeMicros(47445123456).to_json_value(),
+            Value::String(String::from("13:10:45.123456"))
         );
 
         let fields = vec![
@@ -1763,17 +2134,13 @@ mod tests {
             ("Y".to_string(), Field::Double(2.2)),
             ("Z".to_string(), Field::Str("abc".to_string())),
         ];
-        let row = Field::Group(make_row(fields));
+        let row = Field::Group(Row::new(fields));
         assert_eq!(
             row.to_json_value(),
             serde_json::json!({"X": 1, "Y": 2.2, "Z": "abc"})
         );
 
-        let row = Field::ListInternal(make_list(vec![
-            Field::Int(1),
-            Field::Int(12),
-            Field::Null,
-        ]));
+        let row = Field::ListInternal(make_list(vec![Field::Int(1), Field::Int(12), Field::Null]));
         let array = vec![
             Value::Number(serde_json::Number::from(1)),
             Value::Number(serde_json::Number::from(12)),
@@ -1794,16 +2161,16 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::approx_constant, clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names)]
 mod api_tests {
-    use super::{make_list, make_map, make_row};
+    use super::{Row, make_list, make_map};
     use crate::record::Field;
 
     #[test]
     fn test_field_visibility() {
-        let row = make_row(vec![(
+        let row = Row::new(vec![(
             "a".to_string(),
-            Field::Group(make_row(vec![
+            Field::Group(Row::new(vec![
                 ("x".to_string(), Field::Null),
                 ("Y".to_string(), Field::Int(2)),
             ])),
@@ -1815,7 +2182,7 @@ mod api_tests {
                 match column.1 {
                     Field::Group(r) => {
                         assert_eq!(
-                            &make_row(vec![
+                            &Row::new(vec![
                                 ("x".to_string(), Field::Null),
                                 ("Y".to_string(), Field::Int(2)),
                             ]),
@@ -1833,7 +2200,7 @@ mod api_tests {
     fn test_list_element_access() {
         let expected = vec![
             Field::Int(1),
-            Field::Group(make_row(vec![
+            Field::Group(Row::new(vec![
                 ("x".to_string(), Field::Null),
                 ("Y".to_string(), Field::Int(2)),
             ])),

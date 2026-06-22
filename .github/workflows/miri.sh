@@ -1,17 +1,46 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Script
 #
 # Must be run with nightly rust for example
 # rustup default nightly
 
+set -e
 
-# stacked borrows checking uses too much memory to run successfully in github actions
-# re-enable if the CI is migrated to something more powerful (https://github.com/apache/arrow-rs/issues/1833)
-# see also https://github.com/rust-lang/miri/issues/1367
-export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-disable-stacked-borrows"
-cargo miri setup
-cargo clean
+setup_miri() {
+    export MIRIFLAGS="-Zmiri-disable-isolation"
+    cargo miri setup
+    cargo clean
+}
 
-echo "Starting Arrow MIRI run..."
-cargo miri test -p arrow -- --skip csv --skip ipc --skip json
+
+case $# in 
+    0)
+        setup_miri
+
+        echo "Starting Arrow MIRI run..."
+        cargo miri nextest run \
+        -p arrow-buffer -p arrow-data \
+        -p arrow-schema -p arrow-ord \
+        -p arrow-array -p arrow-arith \
+        --features ffi --no-fail-fast
+    ;;
+    2)
+        setup_miri
+
+        partition=$1
+        total=$2
+
+        echo "Starting Arrow MIRI run partition ${partition} out of ${total}..."
+        cargo miri nextest run \
+        --partition slice:"${partition}"/"${total}" \
+        -p arrow-buffer -p arrow-data \
+        -p arrow-schema -p arrow-ord \
+        -p arrow-array -p arrow-arith \
+        --features ffi --no-fail-fast
+    ;;
+    *)
+        echo "usage: $0 [partition total]" >&2
+        exit 1
+    ;;
+esac

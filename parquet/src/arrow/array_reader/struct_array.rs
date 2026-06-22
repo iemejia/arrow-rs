@@ -17,10 +17,9 @@
 
 use crate::arrow::array_reader::ArrayReader;
 use crate::errors::{ParquetError, Result};
-use arrow::array::{
-    ArrayData, ArrayDataBuilder, ArrayRef, BooleanBufferBuilder, StructArray,
-};
-use arrow::datatypes::DataType as ArrowType;
+use arrow_array::{Array, ArrayRef, StructArray, builder::BooleanBufferBuilder};
+use arrow_buffer::NullBuffer;
+use arrow_schema::{DataType as ArrowType, DataType};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -71,7 +70,7 @@ impl ArrayReader for StructArrayReader {
                 Some(expected) => {
                     if expected != child_read {
                         return Err(general_err!(
-                            "StructArrayReader out of sync in read_records, expected {} skipped, got {}",
+                            "StructArrayReader out of sync in read_records, expected {} read, got {}",
                             expected,
                             child_read
                         ));
@@ -113,10 +112,10 @@ impl ArrayReader for StructArrayReader {
             .collect::<Result<Vec<_>>>()?;
 
         // check that array child data has same size
-        let children_array_len =
-            children_array.first().map(|arr| arr.len()).ok_or_else(|| {
-                general_err!("Struct array reader should have at least one child!")
-            })?;
+        let children_array_len = children_array
+            .first()
+            .map(|arr| arr.len())
+            .ok_or_else(|| general_err!("Struct array reader should have at least one child!"))?;
 
         let all_children_len_eq = children_array
             .iter()
@@ -125,16 +124,15 @@ impl ArrayReader for StructArrayReader {
             return Err(general_err!("Not all children array length are the same!"));
         }
 
-        // Now we can build array data
-        let mut array_data_builder = ArrayDataBuilder::new(self.data_type.clone())
-            .len(children_array_len)
-            .child_data(
-                children_array
-                    .iter()
-                    .map(|x| x.data().clone())
-                    .collect::<Vec<ArrayData>>(),
-            );
+        let DataType::Struct(fields) = &self.data_type else {
+            return Err(general_err!(
+                "Internal: StructArrayReader must have struct data type, got {:?}",
+                self.data_type
+            ));
+        };
+        let fields = fields.clone(); // cloning Fields is cheap (Arc internally)
 
+        let mut nulls = None;
         if self.nullable {
             // calculate struct def level data
 
@@ -160,8 +158,13 @@ impl ArrayReader for StructArrayReader {
                     }
                 }
                 None => {
-                    for def_level in def_levels {
-                        bitmap_builder.append(*def_level >= self.struct_def_level)
+                    // Safety: slice iterator has a trusted length
+                    unsafe {
+                        bitmap_builder.extend_trusted_len(
+                            def_levels
+                                .iter()
+                                .map(|level| *level >= self.struct_def_level),
+                        )
                     }
                 }
             }
@@ -169,13 +172,19 @@ impl ArrayReader for StructArrayReader {
             if bitmap_builder.len() != children_array_len {
                 return Err(general_err!("Failed to decode level data for struct array"));
             }
-
-            array_data_builder =
-                array_data_builder.null_bit_buffer(Some(bitmap_builder.finish()));
+            nulls = Some(NullBuffer::from(bitmap_builder));
         }
 
-        let array_data = unsafe { array_data_builder.build_unchecked() };
-        Ok(Arc::new(StructArray::from(array_data)))
+        // Safety: checked above that all children array data have same
+        // length and correct type
+        unsafe {
+            Ok(Arc::new(StructArray::new_unchecked_with_length(
+                fields,
+                children_array,
+                nulls,
+                children_array_len,
+            )))
+        }
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
@@ -214,51 +223,41 @@ impl ArrayReader for StructArrayReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array_reader::test_util::InMemoryArrayReader;
     use crate::arrow::array_reader::ListArrayReader;
-    use arrow::array::{Array, Int32Array, ListArray};
+    use crate::arrow::array_reader::test_util::make_int32_page_reader;
     use arrow::buffer::Buffer;
     use arrow::datatypes::Field;
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Array, ListArray};
+    use arrow_schema::Fields;
 
     #[test]
     fn test_struct_array_reader() {
-        let array_1 = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
-        let array_reader_1 = InMemoryArrayReader::new(
-            ArrowType::Int32,
-            array_1.clone(),
-            Some(vec![0, 1, 2, 3, 1]),
-            Some(vec![0, 1, 1, 1, 1]),
-        );
+        let array_reader_1 = make_int32_page_reader(&[4], &[0, 1, 2, 3, 1], &[0, 1, 1, 1, 1], 3, 1);
 
-        let array_2 = Arc::new(Int32Array::from(vec![5, 4, 3, 2, 1]));
-        let array_reader_2 = InMemoryArrayReader::new(
-            ArrowType::Int32,
-            array_2.clone(),
-            Some(vec![0, 1, 3, 1, 2]),
-            Some(vec![0, 1, 1, 1, 1]),
-        );
+        let array_reader_2 = make_int32_page_reader(&[3], &[0, 1, 3, 1, 2], &[0, 1, 1, 1, 1], 3, 1);
 
-        let struct_type = ArrowType::Struct(vec![
-            Field::new("f1", array_1.data_type().clone(), true),
-            Field::new("f2", array_2.data_type().clone(), true),
-        ]);
+        let struct_type = ArrowType::Struct(Fields::from(vec![
+            Field::new("f1", ArrowType::Int32, true),
+            Field::new("f2", ArrowType::Int32, true),
+        ]));
 
         let mut struct_array_reader = StructArrayReader::new(
             struct_type,
-            vec![Box::new(array_reader_1), Box::new(array_reader_2)],
+            vec![array_reader_1, array_reader_2],
             1,
             1,
             true,
         );
 
         let struct_array = struct_array_reader.next_batch(5).unwrap();
-        let struct_array = struct_array.as_any().downcast_ref::<StructArray>().unwrap();
+        let struct_array = struct_array.as_struct();
 
         assert_eq!(5, struct_array.len());
         assert_eq!(
             vec![true, false, false, false, false],
             (0..5)
-                .map(|idx| struct_array.data_ref().is_null(idx))
+                .map(|idx| struct_array.is_null(idx))
                 .collect::<Vec<bool>>()
         );
         assert_eq!(
@@ -281,43 +280,25 @@ mod tests {
         //    null,
         // ]
 
-        let expected_l =
-            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-                Some(vec![Some(1), Some(2), None]),
-                Some(vec![]),
-                None,
-                None,
-            ]));
+        let expected_l = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2), None]),
+            Some(vec![]),
+            None,
+            None,
+        ]));
 
         let validity = Buffer::from([0b00000111]);
         let struct_fields = vec![(
-            Field::new("foo", expected_l.data_type().clone(), true),
+            Arc::new(Field::new("foo", expected_l.data_type().clone(), true)),
             expected_l.clone() as ArrayRef,
         )];
         let expected = StructArray::from((struct_fields, validity));
 
-        let array = Arc::new(Int32Array::from_iter(vec![
-            Some(1),
-            Some(2),
-            None,
-            None,
-            None,
-            None,
-        ]));
-        let reader = InMemoryArrayReader::new(
-            ArrowType::Int32,
-            array,
-            Some(vec![4, 4, 3, 2, 1, 0]),
-            Some(vec![0, 1, 1, 0, 0, 0]),
-        );
+        let reader =
+            make_int32_page_reader(&[1, 2], &[4, 4, 3, 2, 1, 0], &[0, 1, 1, 0, 0, 0], 4, 1);
 
-        let list_reader = ListArrayReader::<i32>::new(
-            Box::new(reader),
-            expected_l.data_type().clone(),
-            3,
-            1,
-            true,
-        );
+        let list_reader =
+            ListArrayReader::<i32>::new(reader, expected_l.data_type().clone(), 3, 1, true);
 
         let mut struct_reader = StructArrayReader::new(
             expected.data_type().clone(),
@@ -328,7 +309,7 @@ mod tests {
         );
 
         let actual = struct_reader.next_batch(1024).unwrap();
-        let actual = actual.as_any().downcast_ref::<StructArray>().unwrap();
+        let actual = actual.as_struct();
         assert_eq!(actual, &expected)
     }
 }

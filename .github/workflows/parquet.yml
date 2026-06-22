@@ -19,16 +19,32 @@
 # tests for parquet crate
 name: "parquet"
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
 
-# trigger for all PRs that touch certain files and changes to master
+# trigger for all PRs that touch certain files and changes to main
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
     paths:
       - arrow/**
+      - arrow-array/**
+      - arrow-buffer/**
+      - arrow-cast/**
+      - arrow-data/**
+      - arrow-schema/**
+      - arrow-select/**
+      - arrow-ipc/**
+      - arrow-csv/**
+      - arrow-json/**
+      - arrow-avro/**
       - parquet/**
+      - parquet-variant/**
+      - parquet-variant-compute/**
+      - parquet-variant-json/**
       - .github/**
 
 jobs:
@@ -38,44 +54,34 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: amd64/rust
-      env:
-        # Disable full debug symbol generation to speed up CI build and keep memory down
-        # "1" means line tables only, which is useful for panic tracebacks.
-        RUSTFLAGS: "-C debuginfo=1"
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
-        with:
-          rust-version: stable
       - name: Test
-        run: |
-          cargo test -p parquet
+        run: cargo test -p parquet
       - name: Test --all-features
+        run: cargo test -p parquet --all-features
+      - name: Run examples
         run: |
-          cargo test -p parquet --all-features
+          # Test parquet examples
+          cargo run -p parquet --example read_parquet
+          cargo run -p parquet --example read_with_rowgroup --features="async"
 
-
-  # test compilaton
+  # test compilation
   linux-features:
     name: Check Compilation
     runs-on: ubuntu-latest
     container:
       image: amd64/rust
-      env:
-        # Disable full debug symbol generation to speed up CI build and keep memory down
-        # "1" means line tables only, which is useful for panic tracebacks.
-        RUSTFLAGS: "-C debuginfo=1"
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
-        with:
-          rust-version: stable
 
         # Run different tests for the library on its own as well as
         # all targets to ensure that it still works in the absence of
@@ -88,29 +94,93 @@ jobs:
         # 3. compiles with just arrow feature
         # 3. compiles with all features
       - name: Check compilation
-        run: |
-          cargo check -p parquet
+        run: cargo check -p parquet
       - name: Check compilation --no-default-features
-        run: |
-          cargo check -p parquet --no-default-features
+        run: cargo check -p parquet --no-default-features
       - name: Check compilation --no-default-features --features arrow
-        run: |
-          cargo check -p parquet --no-default-features --features arrow
+        run: cargo check -p parquet --no-default-features --features arrow
+      - name: Check compilation --no-default-features --features simdutf8
+        run: cargo check -p parquet --no-default-features --features simdutf8
       - name: Check compilation --no-default-features --all-features
-        run: |
-          cargo check -p parquet --all-features
+        run: cargo check -p parquet --all-features
       - name: Check compilation --all-targets
-        run: |
-          cargo check -p parquet --all-targets
+        run: cargo check -p parquet --all-targets
       - name: Check compilation --all-targets --no-default-features
-        run: |
-          cargo check -p parquet --all-targets --no-default-features
+        run: cargo check -p parquet --all-targets --no-default-features
       - name: Check compilation  --all-targets --no-default-features --features arrow
-        run: |
-          cargo check -p parquet --all-targets --no-default-features --features arrow
+        run: cargo check -p parquet --all-targets --no-default-features --features arrow
       - name: Check compilation  --all-targets --all-features
+        run: cargo check -p parquet --all-targets --all-features
+      - name: Check compilation  --all-targets --no-default-features --features json
+        run: cargo check -p parquet --all-targets --no-default-features --features json
+      - name: Check compilation --no-default-features --features encryption --features async
+        run: cargo check -p parquet --no-default-features --features encryption --features async
+      - name: Check compilation --no-default-features --features flate2, this is expected to fail
+        run: if `cargo check -p parquet --no-default-features --features flate2 2>/dev/null`; then false; else true; fi
+      - name: Check compilation --no-default-features --features flate2 --features flate2-rust_backened
+        run: cargo check -p parquet --no-default-features --features flate2 --features flate2-rust_backened
+      - name: Check compilation --no-default-features --features flate2 --features flate2-zlib-rs
+        run: cargo check -p parquet --no-default-features --features flate2 --features flate2-zlib-rs
+      - name: Check compilation --no-default-features --features variant_experimental
+        run: cargo check -p parquet --no-default-features --features variant_experimental
+
+
+  # test the parquet crate builds against wasm32 in stable rust
+  wasm32-build:
+    name: Build wasm32
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Install wasm32 targets
         run: |
-          cargo check -p parquet --all-targets --all-features
+            rustup target add wasm32-unknown-unknown
+            rustup target add wasm32-wasip1
+      - name: Install clang # Needed for zlib compilation
+        run: apt-get update && apt-get install -y clang gcc-multilib
+      - name: Build wasm32-unknown-unknown
+        run: cargo build -p parquet --target wasm32-unknown-unknown
+      - name: Build wasm32-wasip1
+        run: cargo build -p parquet --target wasm32-wasip1
+
+  pyspark-integration-test:
+    name: PySpark Integration Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [ stable ]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - name: Install Python dependencies
+        run: |
+          cd parquet/pytest
+          pip install -r requirements.txt
+      - name: Black check the test files
+        run: |
+          cd parquet/pytest
+          black --check *.py --verbose
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust }}
+          rustup default ${{ matrix.rust }}
+      - name: Install binary for checking
+        run: |
+          cargo install --path parquet --bin parquet-show-bloom-filter --features=cli
+          cargo install --path parquet --bin parquet-fromcsv --features=arrow,cli
+      - name: Run pytest
+        run: |
+          cd parquet/pytest
+          pytest -v
 
   clippy:
     name: Clippy
@@ -118,14 +188,10 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
-        with:
-          rust-version: stable
       - name: Setup Clippy
-        run: |
-          rustup component add clippy
+        run: rustup component add clippy
       - name: Run clippy
-        run: |
-          cargo clippy -p parquet --all-targets --all-features -- -D warnings
+        run: cargo clippy -p parquet --all-targets --all-features -- -D warnings

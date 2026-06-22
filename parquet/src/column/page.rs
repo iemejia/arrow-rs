@@ -17,49 +17,73 @@
 
 //! Contains Parquet Page definitions and page reader interface.
 
+use bytes::Bytes;
+
 use crate::basic::{Encoding, PageType};
 use crate::errors::{ParquetError, Result};
-use crate::file::{metadata::ColumnChunkMetaData, statistics::Statistics};
-use crate::schema::types::{ColumnDescPtr, SchemaDescPtr};
-use crate::util::memory::ByteBufferPtr;
-use parquet_format::PageHeader;
+use crate::file::metadata::thrift::{
+    DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, PageHeader,
+};
+use crate::file::statistics::{Statistics, page_stats_to_thrift};
 
 /// Parquet Page definition.
 ///
 /// List of supported pages.
 /// These are 1-to-1 mapped from the equivalent Thrift definitions, except `buf` which
 /// used to store uncompressed bytes of the page.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Page {
+    /// Data page Parquet format v1.
     DataPage {
-        buf: ByteBufferPtr,
+        /// The underlying data buffer
+        buf: Bytes,
+        /// Number of values in this page
         num_values: u32,
+        /// Encoding for values in this page
         encoding: Encoding,
+        /// Definition level encoding
         def_level_encoding: Encoding,
+        /// Repetition level encoding
         rep_level_encoding: Encoding,
+        /// Optional statistics for this page
         statistics: Option<Statistics>,
     },
+    /// Data page Parquet format v2.
     DataPageV2 {
-        buf: ByteBufferPtr,
+        /// The underlying data buffer
+        buf: Bytes,
+        /// Number of values in this page
         num_values: u32,
+        /// Encoding for values in this page
         encoding: Encoding,
+        /// Number of null values in this page
         num_nulls: u32,
+        /// Number of rows in this page
         num_rows: u32,
+        /// Length of definition levels
         def_levels_byte_len: u32,
+        /// Length of repetition levels
         rep_levels_byte_len: u32,
+        /// Is this page compressed
         is_compressed: bool,
+        /// Optional statistics for this page
         statistics: Option<Statistics>,
     },
+    /// Dictionary page.
     DictionaryPage {
-        buf: ByteBufferPtr,
+        /// The underlying data buffer
+        buf: Bytes,
+        /// Number of values in this page
         num_values: u32,
+        /// Encoding for values in this page
         encoding: Encoding,
+        /// Is dictionary page sorted
         is_sorted: bool,
     },
 }
 
 impl Page {
-    /// Returns [`PageType`](crate::basic::PageType) for this page.
+    /// Returns [`PageType`] for this page.
     pub fn page_type(&self) -> PageType {
         match self {
             Page::DataPage { .. } => PageType::DATA_PAGE,
@@ -68,12 +92,22 @@ impl Page {
         }
     }
 
+    /// Returns whether this page is any version of a data page
+    pub fn is_data_page(&self) -> bool {
+        matches!(self, Page::DataPage { .. } | Page::DataPageV2 { .. })
+    }
+
+    /// Returns whether this page is a dictionary page
+    pub fn is_dictionary_page(&self) -> bool {
+        matches!(self, Page::DictionaryPage { .. })
+    }
+
     /// Returns internal byte buffer reference for this page.
-    pub fn buffer(&self) -> &ByteBufferPtr {
+    pub fn buffer(&self) -> &Bytes {
         match self {
-            Page::DataPage { ref buf, .. } => buf,
-            Page::DataPageV2 { ref buf, .. } => buf,
-            Page::DictionaryPage { ref buf, .. } => buf,
+            Page::DataPage { buf, .. } => buf,
+            Page::DataPageV2 { buf, .. } => buf,
+            Page::DictionaryPage { buf, .. } => buf,
         }
     }
 
@@ -86,7 +120,7 @@ impl Page {
         }
     }
 
-    /// Returns this page [`Encoding`](crate::basic::Encoding).
+    /// Returns this page [`Encoding`].
     pub fn encoding(&self) -> Encoding {
         match self {
             Page::DataPage { encoding, .. } => *encoding,
@@ -95,11 +129,11 @@ impl Page {
         }
     }
 
-    /// Returns optional [`Statistics`](crate::file::statistics::Statistics).
+    /// Returns optional [`Statistics`].
     pub fn statistics(&self) -> Option<&Statistics> {
         match self {
-            Page::DataPage { ref statistics, .. } => statistics.as_ref(),
-            Page::DataPageV2 { ref statistics, .. } => statistics.as_ref(),
+            Page::DataPage { statistics, .. } => statistics.as_ref(),
+            Page::DataPageV2 { statistics, .. } => statistics.as_ref(),
             Page::DictionaryPage { .. } => None,
         }
     }
@@ -160,17 +194,132 @@ impl CompressedPage {
 
     /// Returns slice of compressed buffer in the page.
     pub fn data(&self) -> &[u8] {
-        self.compressed_page.buffer().data()
+        self.compressed_page.buffer()
+    }
+
+    /// Returns the number of heap bytes this page currently holds.
+    ///
+    /// This is the page's compressed buffer (the embedded [`Bytes`]); use it to
+    /// account for a buffered page's memory footprint rather than reaching for
+    /// `data().len()` at each call site.
+    pub fn memory_usage(&self) -> usize {
+        self.compressed_page.buffer().len()
+    }
+
+    /// Returns the thrift page header
+    pub(crate) fn to_thrift_header(&self) -> Result<PageHeader> {
+        let uncompressed_size = self.uncompressed_size();
+        let compressed_size = self.compressed_size();
+        if uncompressed_size > i32::MAX as usize {
+            return Err(general_err!(
+                "Page uncompressed size overflow: {}",
+                uncompressed_size
+            ));
+        }
+        if compressed_size > i32::MAX as usize {
+            return Err(general_err!(
+                "Page compressed size overflow: {}",
+                compressed_size
+            ));
+        }
+        let num_values = self.num_values();
+        let encoding = self.encoding();
+        let page_type = self.page_type();
+
+        let mut page_header = PageHeader {
+            r#type: page_type,
+            uncompressed_page_size: uncompressed_size as i32,
+            compressed_page_size: compressed_size as i32,
+            // TODO: Add support for crc checksum
+            crc: None,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: None,
+        };
+
+        match self.compressed_page {
+            Page::DataPage {
+                def_level_encoding,
+                rep_level_encoding,
+                ref statistics,
+                ..
+            } => {
+                let data_page_header = DataPageHeader {
+                    num_values: num_values as i32,
+                    encoding,
+                    definition_level_encoding: def_level_encoding,
+                    repetition_level_encoding: rep_level_encoding,
+                    statistics: page_stats_to_thrift(statistics.as_ref()),
+                };
+                page_header.data_page_header = Some(data_page_header);
+            }
+            Page::DataPageV2 {
+                num_nulls,
+                num_rows,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                is_compressed,
+                ref statistics,
+                ..
+            } => {
+                let data_page_header_v2 = DataPageHeaderV2 {
+                    num_values: num_values as i32,
+                    num_nulls: num_nulls as i32,
+                    num_rows: num_rows as i32,
+                    encoding,
+                    definition_levels_byte_length: def_levels_byte_len as i32,
+                    repetition_levels_byte_length: rep_levels_byte_len as i32,
+                    is_compressed: Some(is_compressed),
+                    statistics: page_stats_to_thrift(statistics.as_ref()),
+                };
+                page_header.data_page_header_v2 = Some(data_page_header_v2);
+            }
+            Page::DictionaryPage { is_sorted, .. } => {
+                let dictionary_page_header = DictionaryPageHeader {
+                    num_values: num_values as i32,
+                    encoding,
+                    is_sorted: Some(is_sorted),
+                };
+                page_header.dictionary_page_header = Some(dictionary_page_header);
+            }
+        }
+        Ok(page_header)
+    }
+
+    /// Update the compressed buffer for a page.
+    /// This might be required when encrypting page data for example.
+    /// The size of uncompressed data must not change.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn with_new_compressed_buffer(mut self, new_buffer: Bytes) -> Self {
+        match &mut self.compressed_page {
+            Page::DataPage { buf, .. } => {
+                *buf = new_buffer;
+            }
+            Page::DataPageV2 { buf, .. } => {
+                *buf = new_buffer;
+            }
+            Page::DictionaryPage { buf, .. } => {
+                *buf = new_buffer;
+            }
+        }
+        self
     }
 }
 
 /// Contains page write metrics.
 pub struct PageWriteSpec {
+    /// The type of page being written
     pub page_type: PageType,
+    /// The total size of the page, before compression
     pub uncompressed_size: usize,
+    /// The compressed size of the page
     pub compressed_size: usize,
+    /// The number of values in the page
     pub num_values: u32,
+    /// The offset of the page in the column chunk
     pub offset: u64,
+    /// The number of bytes written to the underlying sink
     pub bytes_written: u64,
 }
 
@@ -195,34 +344,46 @@ impl PageWriteSpec {
 }
 
 /// Contains metadata for a page
+#[derive(Clone)]
 pub struct PageMetadata {
-    /// The number of rows in this page
-    pub num_rows: usize,
-
+    /// The number of rows within the page if known
+    pub num_rows: Option<usize>,
+    /// The number of levels within the page if known
+    pub num_levels: Option<usize>,
     /// Returns true if the page is a dictionary page
     pub is_dict: bool,
 }
 
-impl TryFrom<&PageHeader> for PageMetadata {
+impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
     type Error = ParquetError;
 
-    fn try_from(value: &PageHeader) -> std::result::Result<Self, Self::Error> {
-        match value.type_ {
-            parquet_format::PageType::DataPage => Ok(PageMetadata {
-                num_rows: value.data_page_header.as_ref().unwrap().num_values as usize,
-                is_dict: false,
-            }),
-            parquet_format::PageType::DictionaryPage => Ok(PageMetadata {
-                num_rows: usize::MIN,
+    fn try_from(
+        value: &crate::file::metadata::thrift::PageHeader,
+    ) -> std::result::Result<Self, Self::Error> {
+        match value.r#type {
+            PageType::DATA_PAGE => {
+                let header = value.data_page_header.as_ref().unwrap();
+                Ok(PageMetadata {
+                    num_rows: None,
+                    num_levels: Some(header.num_values as _),
+                    is_dict: false,
+                })
+            }
+            PageType::DICTIONARY_PAGE => Ok(PageMetadata {
+                num_rows: None,
+                num_levels: None,
                 is_dict: true,
             }),
-            parquet_format::PageType::DataPageV2 => Ok(PageMetadata {
-                num_rows: value.data_page_header_v2.as_ref().unwrap().num_rows as usize,
-                is_dict: false,
-            }),
+            PageType::DATA_PAGE_V2 => {
+                let header = value.data_page_header_v2.as_ref().unwrap();
+                Ok(PageMetadata {
+                    num_rows: Some(header.num_rows as _),
+                    num_levels: Some(header.num_values as _),
+                    is_dict: false,
+                })
+            }
             other => Err(ParquetError::General(format!(
-                "page type {:?} cannot be converted to PageMetadata",
-                other
+                "page type {other:?} cannot be converted to PageMetadata"
             ))),
         }
     }
@@ -242,13 +403,34 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// Skips reading the next page, returns an error if no
     /// column index information
     fn skip_next_page(&mut self) -> Result<()>;
+
+    /// Returns `true` if the next page can be assumed to contain the start of a new record
+    ///
+    /// Prior to parquet V2 the specification was ambiguous as to whether a single record
+    /// could be split across multiple pages, and prior to [(#4327)] the Rust writer would do
+    /// this in certain situations. However, correctly interpreting the offset index relies on
+    /// this assumption holding [(#4943)], and so this mechanism is provided for a [`PageReader`]
+    /// to signal this to the calling context
+    ///
+    /// [(#4327)]: https://github.com/apache/arrow-rs/pull/4327
+    /// [(#4943)]: https://github.com/apache/arrow-rs/pull/4943
+    fn at_record_boundary(&mut self) -> Result<bool> {
+        match self.peek_next_page()? {
+            // Last page in the column chunk - always a record boundary
+            None => Ok(true),
+            // A V2 data page is required by the parquet spec to start at a
+            // record boundary, so the current page ends at one.  V2 pages
+            // are identified by having `num_rows` set in their header.
+            Some(metadata) => Ok(metadata.num_rows.is_some()),
+        }
+    }
 }
 
 /// API for writing pages in a column chunk.
 ///
 /// It is reasonable to assume that all pages will be written in the correct order, e.g.
 /// dictionary page followed by data pages, or a set of data pages, etc.
-pub trait PageWriter {
+pub trait PageWriter: Send {
     /// Writes a page into the output stream/sink.
     /// Returns `PageWriteSpec` that contains information about written page metrics,
     /// including number of bytes, size, number of values, offset, etc.
@@ -257,11 +439,54 @@ pub trait PageWriter {
     /// either data page or dictionary page.
     fn write_page(&mut self, page: CompressedPage) -> Result<PageWriteSpec>;
 
-    /// Writes column chunk metadata into the output stream/sink.
+    /// **Unstable, not public API.** This is an internal protocol between
+    /// [`GenericColumnWriter`] and its in-crate page writers; it is hidden from
+    /// the rendered docs and may change or be removed without a major version
+    /// bump. External `PageWriter` implementations should not override it. See
+    /// the page-spilling cleanup tracked in
+    /// <https://github.com/apache/arrow-rs/pull/10020>.
     ///
-    /// This method is called once before page writer is closed, normally when writes are
-    /// finalised in column writer.
-    fn write_metadata(&mut self, metadata: &ColumnChunkMetaData) -> Result<()>;
+    /// Whether this writer resolves the final page layout itself (at flush)
+    /// rather than committing bytes to their final position as pages arrive.
+    ///
+    /// The dictionary page of a column chunk must be written *first*, but it is
+    /// not finalized until every value has been seen. A writer that commits
+    /// bytes live (e.g. straight to a file) therefore relies on the column
+    /// writer buffering the dictionary-encoded data pages in memory until the
+    /// dictionary page is ready — see [`GenericColumnWriter`]'s `data_pages`.
+    ///
+    /// A writer that instead buffers the whole chunk and splices it later (the
+    /// [`ArrowWriter`] path) can accept data pages *before* the dictionary page
+    /// and order them itself at flush. Returning `true` tells the column writer
+    /// to skip that in-memory buffering and stream dictionary-column data pages
+    /// straight through, bounding the column writer's memory.
+    ///
+    /// [`GenericColumnWriter`]: crate::column::writer::GenericColumnWriter
+    /// [`ArrowWriter`]: crate::arrow::arrow_writer::ArrowWriter
+    #[doc(hidden)]
+    fn defers_dictionary_ordering(&self) -> bool {
+        false
+    }
+
+    /// **Unstable, not public API.** Companion to
+    /// [`defers_dictionary_ordering`](Self::defers_dictionary_ordering): an
+    /// internal hook for the column writer's memory accounting, hidden from the
+    /// rendered docs and subject to change or removal without a major version
+    /// bump. External `PageWriter` implementations should not override it.
+    ///
+    /// The number of bytes this writer is currently holding **in memory** for
+    /// pages it has been handed (i.e. completed pages not yet committed to their
+    /// final destination).
+    ///
+    /// Used by the column writer to report its memory footprint. The default is
+    /// `0`: a writer that streams pages straight to their destination retains
+    /// nothing. A writer that buffers pages should report what it actually holds
+    /// on the heap — which, when it spills to a backing store, can be far less
+    /// than the bytes written.
+    #[doc(hidden)]
+    fn buffered_memory_size(&self) -> usize {
+        0
+    }
 
     /// Closes resources and flushes underlying sink.
     /// Page writer should not be used after this method is called.
@@ -269,13 +494,7 @@ pub trait PageWriter {
 }
 
 /// An iterator over pages of one specific column in a parquet file.
-pub trait PageIterator: Iterator<Item = Result<Box<dyn PageReader>>> + Send {
-    /// Get schema of parquet file.
-    fn schema(&mut self) -> Result<SchemaDescPtr>;
-
-    /// Get column schema of this page iterator.
-    fn column_schema(&mut self) -> Result<ColumnDescPtr>;
-}
+pub trait PageIterator: Iterator<Item = Result<Box<dyn PageReader>>> + Send {}
 
 #[cfg(test)]
 mod tests {
@@ -284,24 +503,24 @@ mod tests {
     #[test]
     fn test_page() {
         let data_page = Page::DataPage {
-            buf: ByteBufferPtr::new(vec![0, 1, 2]),
+            buf: Bytes::from(vec![0, 1, 2]),
             num_values: 10,
             encoding: Encoding::PLAIN,
             def_level_encoding: Encoding::RLE,
             rep_level_encoding: Encoding::RLE,
-            statistics: Some(Statistics::int32(Some(1), Some(2), None, 1, true)),
+            statistics: Some(Statistics::int32(Some(1), Some(2), None, Some(1), true)),
         };
         assert_eq!(data_page.page_type(), PageType::DATA_PAGE);
-        assert_eq!(data_page.buffer().data(), vec![0, 1, 2].as_slice());
+        assert_eq!(data_page.buffer(), vec![0, 1, 2].as_slice());
         assert_eq!(data_page.num_values(), 10);
         assert_eq!(data_page.encoding(), Encoding::PLAIN);
         assert_eq!(
             data_page.statistics(),
-            Some(&Statistics::int32(Some(1), Some(2), None, 1, true))
+            Some(&Statistics::int32(Some(1), Some(2), None, Some(1), true))
         );
 
         let data_page_v2 = Page::DataPageV2 {
-            buf: ByteBufferPtr::new(vec![0, 1, 2]),
+            buf: Bytes::from(vec![0, 1, 2]),
             num_values: 10,
             encoding: Encoding::PLAIN,
             num_nulls: 5,
@@ -309,25 +528,25 @@ mod tests {
             def_levels_byte_len: 30,
             rep_levels_byte_len: 40,
             is_compressed: false,
-            statistics: Some(Statistics::int32(Some(1), Some(2), None, 1, true)),
+            statistics: Some(Statistics::int32(Some(1), Some(2), None, Some(1), true)),
         };
         assert_eq!(data_page_v2.page_type(), PageType::DATA_PAGE_V2);
-        assert_eq!(data_page_v2.buffer().data(), vec![0, 1, 2].as_slice());
+        assert_eq!(data_page_v2.buffer(), vec![0, 1, 2].as_slice());
         assert_eq!(data_page_v2.num_values(), 10);
         assert_eq!(data_page_v2.encoding(), Encoding::PLAIN);
         assert_eq!(
             data_page_v2.statistics(),
-            Some(&Statistics::int32(Some(1), Some(2), None, 1, true))
+            Some(&Statistics::int32(Some(1), Some(2), None, Some(1), true))
         );
 
         let dict_page = Page::DictionaryPage {
-            buf: ByteBufferPtr::new(vec![0, 1, 2]),
+            buf: Bytes::from(vec![0, 1, 2]),
             num_values: 10,
             encoding: Encoding::PLAIN,
             is_sorted: false,
         };
         assert_eq!(dict_page.page_type(), PageType::DICTIONARY_PAGE);
-        assert_eq!(dict_page.buffer().data(), vec![0, 1, 2].as_slice());
+        assert_eq!(dict_page.buffer(), vec![0, 1, 2].as_slice());
         assert_eq!(dict_page.num_values(), 10);
         assert_eq!(dict_page.encoding(), Encoding::PLAIN);
         assert_eq!(dict_page.statistics(), None);
@@ -336,12 +555,12 @@ mod tests {
     #[test]
     fn test_compressed_page() {
         let data_page = Page::DataPage {
-            buf: ByteBufferPtr::new(vec![0, 1, 2]),
+            buf: Bytes::from(vec![0, 1, 2]),
             num_values: 10,
             encoding: Encoding::PLAIN,
             def_level_encoding: Encoding::RLE,
             rep_level_encoding: Encoding::RLE,
-            statistics: Some(Statistics::int32(Some(1), Some(2), None, 1, true)),
+            statistics: Some(Statistics::int32(Some(1), Some(2), None, Some(1), true)),
         };
 
         let cpage = CompressedPage::new(data_page, 5);
@@ -352,5 +571,29 @@ mod tests {
         assert_eq!(cpage.num_values(), 10);
         assert_eq!(cpage.encoding(), Encoding::PLAIN);
         assert_eq!(cpage.data(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn test_compressed_page_uncompressed_size_overflow() {
+        // Test that to_thrift_header fails when uncompressed size exceeds i32::MAX
+        let data_page = Page::DataPage {
+            buf: Bytes::from(vec![0, 1, 2]),
+            num_values: 10,
+            encoding: Encoding::PLAIN,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+
+        // Create a CompressedPage with uncompressed size larger than i32::MAX
+        let uncompressed_size = (i32::MAX as usize) + 1;
+        let cpage = CompressedPage::new(data_page, uncompressed_size);
+
+        // Verify that to_thrift_header returns an error
+        let result = cpage.to_thrift_header();
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Page uncompressed size overflow"));
     }
 }

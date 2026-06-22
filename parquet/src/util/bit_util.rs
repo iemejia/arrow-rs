@@ -17,76 +17,182 @@
 
 use std::{cmp, mem::size_of};
 
-use crate::data_type::AsBytes;
-use crate::util::bit_pack::{unpack16, unpack32, unpack64, unpack8};
-use crate::util::memory::ByteBufferPtr;
+use bytes::Bytes;
+
+use crate::data_type::{AsBytes, ByteArray, FixedLenByteArray, Int96};
+use crate::errors::{ParquetError, Result};
+use crate::util::bit_pack::{unpack8, unpack16, unpack32, unpack64};
 
 #[inline]
-pub fn from_ne_slice<T: FromBytes>(bs: &[u8]) -> T {
-    let mut b = T::Buffer::default();
-    {
-        let b = b.as_mut();
-        let bs = &bs[..b.len()];
-        b.copy_from_slice(bs);
+fn array_from_slice<const N: usize>(bs: &[u8]) -> Result<[u8; N]> {
+    // Need to slice as may be called with zero-padded values
+    match bs.get(..N) {
+        Some(b) => Ok(b.try_into().unwrap()),
+        None => Err(general_err!(
+            "error converting value, expected {} bytes got {}",
+            N,
+            bs.len()
+        )),
     }
-    T::from_ne_bytes(b)
 }
 
-#[inline]
-pub fn from_le_slice<T: FromBytes>(bs: &[u8]) -> T {
-    let mut b = T::Buffer::default();
-    {
-        let b = b.as_mut();
-        let bs = &bs[..b.len()];
-        b.copy_from_slice(bs);
-    }
-    T::from_le_bytes(b)
-}
-
-pub trait FromBytes: Sized {
+/// # Safety
+/// All bit patterns 00000xxxx, where there are `BIT_CAPACITY` `x`s,
+/// must be valid, unless BIT_CAPACITY is 0.
+pub unsafe trait FromBytes: Sized {
+    const BIT_CAPACITY: usize;
     type Buffer: AsMut<[u8]> + Default;
+    fn try_from_le_slice(b: &[u8]) -> Result<Self>;
     fn from_le_bytes(bs: Self::Buffer) -> Self;
-    fn from_be_bytes(bs: Self::Buffer) -> Self;
-    fn from_ne_bytes(bs: Self::Buffer) -> Self;
+}
+
+/// Types that can be decoded from bitpacked representations.
+///
+/// This is implemented for primitive types and bool that can be
+/// directly converted from a u64 value. Types like Int96, ByteArray,
+/// and FixedLenByteArray that cannot be represented in 64 bits do not
+/// implement this trait.
+pub trait FromBitpacked: FromBytes {
+    /// Convert directly from a u64 value by truncation, avoiding byte slice copies.
+    fn from_u64(v: u64) -> Self;
 }
 
 macro_rules! from_le_bytes {
     ($($ty: ty),*) => {
         $(
-        impl FromBytes for $ty {
+        // SAFETY: this macro is used for types for which all bit patterns are valid.
+        unsafe impl FromBytes for $ty {
+            const BIT_CAPACITY: usize = std::mem::size_of::<$ty>() * 8;
             type Buffer = [u8; size_of::<Self>()];
+            fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+                Ok(Self::from_le_bytes(array_from_slice(b)?))
+            }
             fn from_le_bytes(bs: Self::Buffer) -> Self {
                 <$ty>::from_le_bytes(bs)
             }
-            fn from_be_bytes(bs: Self::Buffer) -> Self {
-                <$ty>::from_be_bytes(bs)
-            }
-            fn from_ne_bytes(bs: Self::Buffer) -> Self {
-                <$ty>::from_ne_bytes(bs)
+        }
+        impl FromBitpacked for $ty {
+            #[inline]
+            fn from_u64(v: u64) -> Self {
+                v as Self
             }
         }
         )*
     };
 }
 
-impl FromBytes for bool {
-    type Buffer = [u8; 1];
+from_le_bytes! { u8, u16, u32, u64, i8, i16, i32, i64 }
+
+// SAFETY: all bit patterns are valid for f32 and f64.
+unsafe impl FromBytes for f32 {
+    const BIT_CAPACITY: usize = 32;
+    type Buffer = [u8; 4];
+    fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+        Ok(Self::from_le_bytes(array_from_slice(b)?))
+    }
     fn from_le_bytes(bs: Self::Buffer) -> Self {
-        Self::from_ne_bytes(bs)
-    }
-    fn from_be_bytes(bs: Self::Buffer) -> Self {
-        Self::from_ne_bytes(bs)
-    }
-    fn from_ne_bytes(bs: Self::Buffer) -> Self {
-        match bs[0] {
-            0 => false,
-            1 => true,
-            _ => panic!("Invalid byte when reading bool"),
-        }
+        f32::from_le_bytes(bs)
     }
 }
 
-from_le_bytes! { u8, u16, u32, u64, i8, i16, i32, i64, f32, f64 }
+impl FromBitpacked for f32 {
+    #[inline]
+    fn from_u64(v: u64) -> Self {
+        f32::from_bits(v as u32)
+    }
+}
+
+// SAFETY: all bit patterns are valid for f64.
+unsafe impl FromBytes for f64 {
+    const BIT_CAPACITY: usize = 64;
+    type Buffer = [u8; 8];
+    fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+        Ok(Self::from_le_bytes(array_from_slice(b)?))
+    }
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        f64::from_le_bytes(bs)
+    }
+}
+
+impl FromBitpacked for f64 {
+    #[inline]
+    fn from_u64(v: u64) -> Self {
+        f64::from_bits(v)
+    }
+}
+
+// SAFETY: the 0000000x bit pattern is always valid for `bool`.
+unsafe impl FromBytes for bool {
+    const BIT_CAPACITY: usize = 1;
+    type Buffer = [u8; 1];
+
+    fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+        Ok(Self::from_le_bytes(array_from_slice(b)?))
+    }
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        bs[0] != 0
+    }
+}
+
+impl FromBitpacked for bool {
+    #[inline]
+    fn from_u64(v: u64) -> Self {
+        v != 0
+    }
+}
+
+// SAFETY: BIT_CAPACITY is 0.
+unsafe impl FromBytes for Int96 {
+    const BIT_CAPACITY: usize = 0;
+    type Buffer = [u8; 12];
+
+    fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+        let bs: [u8; 12] = array_from_slice(b)?;
+        let mut i = Int96::new();
+        i.set_data(
+            u32::try_from_le_slice(&bs[0..4])?,
+            u32::try_from_le_slice(&bs[4..8])?,
+            u32::try_from_le_slice(&bs[8..12])?,
+        );
+        Ok(i)
+    }
+
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        let mut i = Int96::new();
+        i.set_data(
+            u32::try_from_le_slice(&bs[0..4]).unwrap(),
+            u32::try_from_le_slice(&bs[4..8]).unwrap(),
+            u32::try_from_le_slice(&bs[8..12]).unwrap(),
+        );
+        i
+    }
+}
+
+// SAFETY: BIT_CAPACITY is 0.
+unsafe impl FromBytes for ByteArray {
+    const BIT_CAPACITY: usize = 0;
+    type Buffer = Vec<u8>;
+
+    fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+        Ok(b.to_vec().into())
+    }
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        bs.into()
+    }
+}
+
+// SAFETY: BIT_CAPACITY is 0.
+unsafe impl FromBytes for FixedLenByteArray {
+    const BIT_CAPACITY: usize = 0;
+    type Buffer = Vec<u8>;
+
+    fn try_from_le_slice(b: &[u8]) -> Result<Self> {
+        Ok(b.to_vec().into())
+    }
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        bs.into()
+    }
+}
 
 /// Reads `size` of bytes from `src`, and reinterprets them as type `ty`, in
 /// little-endian order.
@@ -95,10 +201,10 @@ pub(crate) fn read_num_bytes<T>(size: usize, src: &[u8]) -> T
 where
     T: FromBytes,
 {
-    assert!(size <= src.len());
+    debug_assert!(size <= src.len());
     let mut buffer = <T as FromBytes>::Buffer::default();
     buffer.as_mut()[..size].copy_from_slice(&src[..size]);
-    <T>::from_ne_bytes(buffer)
+    <T>::from_le_bytes(buffer)
 }
 
 /// Returns the ceil of value/divisor.
@@ -106,8 +212,8 @@ where
 /// This function should be removed after
 /// [`int_roundings`](https://github.com/rust-lang/rust/issues/88581) is stable.
 #[inline]
-pub fn ceil<T: num::Integer>(value: T, divisor: T) -> T {
-    num::Integer::div_ceil(&value, &divisor)
+pub fn ceil<T: num_integer::Integer>(value: T, divisor: T) -> T {
+    num_integer::Integer::div_ceil(&value, &divisor)
 }
 
 /// Returns the `num_bits` least-significant bits of `v`
@@ -134,24 +240,46 @@ pub fn get_bit(data: &[u8], i: usize) -> bool {
     (data[i >> 3] & BIT_MASK[i & 7]) != 0
 }
 
-/// Utility class for writing bit/byte streams. This class can write data in either
-/// bit packed or byte aligned fashion.
+/// Writes bit packed values to an in-memory buffer.
+///
+/// `BitWriter` is the dual of [`BitReader`] and can write values that are either
+/// byte aligned or packed at arbitrary bit widths. It is primarily used by the
+/// Parquet RLE/bit-packing hybrid encoder.
+///
+/// Bit-packed values are appended to an internal buffer in
+/// little-endian bit order: the first value written occupies the
+/// least-significant bits of the first byte. Bits that have not yet filled a
+/// whole byte are held in an internal accumulator until a byte-aligning
+/// operation (such as [`BitWriter::flush`], [`BitWriter::put_aligned`], or
+/// [`BitWriter::consume`]) is called.
+///
+/// Use [`BitWriter::consume`] to take ownership of the underlying buffer once
+/// writing is complete.
+///
+/// [`BitReader`]: crate::util::bit_util::BitReader
 pub struct BitWriter {
+    /// Output Buffer
     buffer: Vec<u8>,
+    /// Accumulator for in progress values
     buffered_values: u64,
+    /// Current write offset within `buffered_values`
     bit_offset: u8,
 }
 
 impl BitWriter {
-    pub fn new(max_bytes: usize) -> Self {
+    /// Creates a new [`BitWriter`] backed by an internal buffer of the given
+    /// initial capacity.
+    pub fn new(initial_capacity: usize) -> Self {
         Self {
-            buffer: Vec::with_capacity(max_bytes),
+            buffer: Vec::with_capacity(initial_capacity),
             buffered_values: 0,
             bit_offset: 0,
         }
     }
 
-    /// Initializes the writer appending to the existing buffer `buffer`
+    /// Creates a new [`BitWriter`] that appends to the existing `buffer`.
+    ///
+    /// Data written with this writer are appended after existing values.
     pub fn new_from_buf(buffer: Vec<u8>) -> Self {
         Self {
             buffer,
@@ -160,22 +288,37 @@ impl BitWriter {
         }
     }
 
-    /// Consumes and returns the current buffer.
+    /// Flushes any buffered bits to a byte boundary, then consumes this
+    /// writer and returns the underlying buffer.
     #[inline]
     pub fn consume(mut self) -> Vec<u8> {
         self.flush();
         self.buffer
     }
 
-    /// Flushes the internal buffered bits and returns the buffer's content.
-    /// This is a borrow equivalent of `consume` method.
+    /// Flushes any buffered bits to a byte boundary and returns a borrowed
+    /// view of the buffer's contents.
+    ///
+    /// This is the borrowing equivalent of [`BitWriter::consume`]. The writer
+    /// can continue to be used after this call.
     #[inline]
     pub fn flush_buffer(&mut self) -> &[u8] {
         self.flush();
         self.buffer()
     }
 
-    /// Clears the internal state so the buffer can be reused.
+    /// Like [`BitWriter::flush_buffer`], but returns mutable access to the
+    /// buffer.
+    #[inline]
+    pub fn flush_buffer_mut(&mut self) -> &mut [u8] {
+        self.flush();
+        &mut self.buffer
+    }
+
+    /// Clears the internal state.
+    ///
+    /// Truncates the underlying buffer to length 0 (preserving its capacity)
+    /// and resets the bit accumulator.
     #[inline]
     pub fn clear(&mut self) {
         self.buffer.clear();
@@ -183,7 +326,12 @@ impl BitWriter {
         self.bit_offset = 0;
     }
 
-    /// Flushes the internal buffered bits and the align the buffer to the next byte.
+    /// Flushes any buffered bits and aligns the writer to the next byte
+    /// boundary.
+    ///
+    /// Any partial byte currently held in the bit accumulator is appended to
+    /// the buffer, and the accumulator is reset. Subsequent writes will start
+    /// at a byte boundary.
     #[inline]
     pub fn flush(&mut self) {
         let num_bytes = ceil(self.bit_offset, 8);
@@ -193,55 +341,88 @@ impl BitWriter {
         self.bit_offset = 0;
     }
 
-    /// Advances the current offset by skipping `num_bytes`, flushing the internal bit
-    /// buffer first.
-    /// This is useful when you want to jump over `num_bytes` bytes and come back later
-    /// to fill these bytes.
+    /// Reserves `num_bytes` bytes of zero-filled space at the current
+    /// position and returns the byte offset of the start of that region.
+    ///
+    /// Internally flushes any buffered bits first so the reservation begins
+    /// at a byte boundary. Use the returned offset together with
+    /// [`BitWriter::write_at`] or [`BitWriter::put_aligned_offset`] to fill
+    /// in the reserved bytes once their contents are known (for example, a
+    /// length prefix that depends on subsequently encoded data).
     #[inline]
     pub fn skip(&mut self, num_bytes: usize) -> usize {
         self.flush();
         let result = self.buffer.len();
-        self.buffer.extend(std::iter::repeat(0).take(num_bytes));
+        self.buffer.extend(std::iter::repeat_n(0, num_bytes));
         result
     }
 
-    /// Returns a slice containing the next `num_bytes` bytes starting from the current
-    /// offset, and advances the underlying buffer by `num_bytes`.
-    /// This is useful when you want to jump over `num_bytes` bytes and come back later
-    /// to fill these bytes.
+    /// Reserves `num_bytes` bytes at the current position and returns a
+    /// mutable slice over them.
+    ///
+    /// Equivalent to [`BitWriter::skip`], but returns the reserved region
+    /// directly so it can be written into. Useful for filling in a header
+    /// (such as a length prefix) once the size of the following payload is
+    /// known.
     #[inline]
     pub fn get_next_byte_ptr(&mut self, num_bytes: usize) -> &mut [u8] {
         let offset = self.skip(num_bytes);
         &mut self.buffer[offset..offset + num_bytes]
     }
 
+    /// Returns the total number of bytes written so far, including any
+    /// partial byte still held in the bit accumulator (rounded up).
     #[inline]
     pub fn bytes_written(&self) -> usize {
         self.buffer.len() + ceil(self.bit_offset, 8) as usize
     }
 
+    /// Returns a borrowed view of the bytes that have been flushed to the
+    /// underlying buffer so far.
+    ///
+    /// Note that bits currently held in the bit accumulator (i.e. not yet
+    /// flushed to a byte boundary) are not included. Use
+    /// [`BitWriter::flush_buffer`] to also flush pending bits before reading.
     #[inline]
     pub fn buffer(&self) -> &[u8] {
         &self.buffer
     }
 
+    /// Returns the current offset within the output buffer.
+    ///
+    /// This is the index of the next byte that a byte-aligned write would
+    /// land in (excluding any bits currently held in the bit accumulator).
     #[inline]
     pub fn byte_offset(&self) -> usize {
         self.buffer.len()
     }
 
-    /// Writes the entire byte `value` at the byte `offset`
+    /// Overwrites the byte at position `offset` in the underlying buffer
+    /// with `value`.
+    ///
+    /// Typically used together with [`BitWriter::skip`] or
+    /// [`BitWriter::get_next_byte_ptr`] to back-fill a previously reserved
+    /// byte once its value is known.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset` is out of bounds for the underlying buffer.
     pub fn write_at(&mut self, offset: usize, value: u8) {
         self.buffer[offset] = value;
     }
 
-    /// Writes the `num_bits` LSB of value `v` to the internal buffer of this writer.
-    /// The `num_bits` must not be greater than 64. This is bit packed.
+    /// Writes the `num_bits` least-significant bits of `v` to the writer in
+    /// bit-packed form.
+    ///
+    /// Values are packed in little-endian bit order: this call appends
+    /// `num_bits` bits starting at the current bit position.
+    ///
+    /// `num_bits` must be no larger than 64.
     #[inline]
     pub fn put_value(&mut self, v: u64, num_bits: usize) {
-        assert!(num_bits <= 64);
+        debug_assert!(num_bits <= 64);
         let num_bits = num_bits as u8;
-        assert_eq!(v.checked_shr(num_bits as u32).unwrap_or(0), 0); // covers case v >> 64
+        debug_assert_eq!(v.checked_shr(num_bits as u32).unwrap_or(0), 0); // covers case v >> 64
 
         // Add value to buffered_values
         self.buffered_values |= v << self.bit_offset;
@@ -259,8 +440,12 @@ impl BitWriter {
         }
     }
 
-    /// Writes `val` of `num_bytes` bytes to the next aligned byte. If size of `T` is
-    /// larger than `num_bytes`, extra higher ordered bytes will be ignored.
+    /// Writes the first `num_bytes` little-endian bytes of `val` to the
+    /// writer at the next byte boundary.
+    ///
+    /// Any buffered bits are first flushed so the value is byte-aligned in
+    /// the output. If `T` is wider than `num_bytes`, the high-order bytes
+    /// are silently truncated.
     #[inline]
     pub fn put_aligned<T: AsBytes>(&mut self, val: T, num_bytes: usize) {
         self.flush();
@@ -269,24 +454,34 @@ impl BitWriter {
         self.buffer.extend_from_slice(&slice[..len]);
     }
 
-    /// Writes `val` of `num_bytes` bytes at the designated `offset`. The `offset` is the
-    /// offset starting from the beginning of the internal buffer that this writer
-    /// maintains. Note that this will overwrite any existing data between `offset` and
-    /// `offset + num_bytes`. Also that if size of `T` is larger than `num_bytes`, extra
-    /// higher ordered bytes will be ignored.
+    /// Writes the first `num_bytes` little-endian bytes of `val` at the
+    /// given `offset` in the underlying buffer, overwriting any existing
+    /// data in `offset..offset + num_bytes`.
+    ///
+    /// `offset` is measured from the start of the internal buffer. If `T`
+    /// is wider than `num_bytes`, the high-order bytes are silently
+    /// truncated.
+    ///
+    /// Typically used together with [`BitWriter::skip`] to back-fill a
+    /// previously reserved region once its contents are known.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + min(size_of::<T>(), num_bytes)` is out of bounds
+    /// for the underlying buffer.
     #[inline]
-    pub fn put_aligned_offset<T: AsBytes>(
-        &mut self,
-        val: T,
-        num_bytes: usize,
-        offset: usize,
-    ) {
+    pub fn put_aligned_offset<T: AsBytes>(&mut self, val: T, num_bytes: usize, offset: usize) {
         let slice = val.as_bytes();
         let len = num_bytes.min(slice.len());
         self.buffer[offset..offset + len].copy_from_slice(&slice[..len])
     }
 
-    /// Writes a VLQ encoded integer `v` to this buffer. The value is byte aligned.
+    /// Writes `v` to the buffer in VLQ (variable-length quantity) encoding,
+    /// in little-endian byte order.
+    ///
+    /// Any buffered bits are first flushed so the encoding starts at a byte
+    /// boundary. The encoded form is between 1 and [`MAX_VLQ_BYTE_LEN`]
+    /// bytes long, depending on the magnitude of `v`.
     #[inline]
     pub fn put_vlq_int(&mut self, mut v: u64) {
         while v & 0xFFFFFFFFFFFFFF80 != 0 {
@@ -296,14 +491,29 @@ impl BitWriter {
         self.put_aligned::<u8>((v & 0x7F) as u8, 1);
     }
 
-    /// Writes a zigzag-VLQ encoded (in little endian order) int `v` to this buffer.
+    /// Writes `v` to the buffer in zigzag-VLQ encoding, in little-endian
+    /// byte order.
+    ///
     /// Zigzag-VLQ is a variant of VLQ encoding where negative and positive
-    /// numbers are encoded in a zigzag fashion.
-    /// See: https://developers.google.com/protocol-buffers/docs/encoding
+    /// numbers are interleaved so that small absolute values produce short
+    /// encodings regardless of sign. See the [Protocol Buffers encoding
+    /// documentation](https://developers.google.com/protocol-buffers/docs/encoding)
+    /// for details.
+    ///
+    /// As with [`BitWriter::put_vlq_int`], any buffered bits are first
+    /// flushed so the encoding starts at a byte boundary.
     #[inline]
     pub fn put_zigzag_vlq_int(&mut self, v: i64) {
         let u: u64 = ((v << 1) ^ (v >> 63)) as u64;
         self.put_vlq_int(u)
+    }
+
+    /// Returns an estimate of the heap memory used by this writer, in bytes.
+    ///
+    /// This reflects the capacity of the underlying buffer rather than the
+    /// number of bytes actually written.
+    pub fn estimated_memory_size(&self) -> usize {
+        self.buffer.capacity() * size_of::<u8>()
     }
 }
 
@@ -311,125 +521,136 @@ impl BitWriter {
 /// MAX_VLQ_BYTE_LEN = 5 for i32, and MAX_VLQ_BYTE_LEN = 10 for i64
 pub const MAX_VLQ_BYTE_LEN: usize = 10;
 
+/// Reads bit packed values from an in-memory buffer.
+///
+/// `BitReader` is the dual of [`BitWriter`] and reads values that are either
+/// byte aligned or packed at arbitrary bit widths. It is primarily used by the
+/// Parquet RLE/bit-packing hybrid decoder.
+///
+/// Reads advance an internal cursor; once the buffer is exhausted, the
+/// `get_*` methods return `None` rather than panicking. To rewind, use
+/// [`BitReader::reset`] with the same (or a different) buffer.
 pub struct BitReader {
-    // The byte buffer to read from, passed in by client
-    buffer: ByteBufferPtr,
+    /// The byte buffer to read from, passed in by client
+    buffer: Bytes,
 
-    // Bytes are memcpy'd from `buffer` and values are read from this variable.
-    // This is faster than reading values byte by byte directly from `buffer`
+    /// Bytes are memcpy'd from `buffer` and values are read from this variable.
+    /// This is faster than reading values byte by byte directly from `buffer`
+    ///
+    /// This is only populated when `self.bit_offset != 0`
     buffered_values: u64,
 
-    //
-    // End                                         Start
-    // |............|B|B|B|B|B|B|B|B|..............|
-    //                   ^          ^
-    //                 bit_offset   byte_offset
-    //
-    // Current byte offset in `buffer`
+    ///
+    /// End                                         Start
+    /// |............|B|B|B|B|B|B|B|B|..............|
+    ///                   ^          ^
+    ///                 bit_offset   byte_offset
+    ///
+    /// Current byte offset in `buffer`
     byte_offset: usize,
 
-    // Current bit offset in `buffered_values`
+    /// Current bit offset in `buffered_values`
     bit_offset: usize,
-
-    // Total number of bytes in `buffer`
-    total_bytes: usize,
 }
 
-/// Utility class to read bit/byte stream. This class can read bits or bytes that are
-/// either byte aligned or not.
 impl BitReader {
-    pub fn new(buffer: ByteBufferPtr) -> Self {
-        let total_bytes = buffer.len();
-        let num_bytes = cmp::min(8, total_bytes);
-        let buffered_values = read_num_bytes::<u64>(num_bytes, buffer.as_ref());
+    /// Creates a new [`BitReader`] that reads from `buffer`, starting at
+    /// bit offset 0.
+    pub fn new(buffer: Bytes) -> Self {
         BitReader {
             buffer,
-            buffered_values,
+            buffered_values: 0,
             byte_offset: 0,
             bit_offset: 0,
-            total_bytes,
         }
     }
 
-    pub fn reset(&mut self, buffer: ByteBufferPtr) {
+    /// Resets this reader to read from the start of `buffer`, discarding any
+    /// previous buffer and position.
+    ///
+    /// This is useful for reusing the same `BitReader` instance across
+    /// multiple input buffers without allocation.
+    pub fn reset(&mut self, buffer: Bytes) {
         self.buffer = buffer;
-        self.total_bytes = self.buffer.len();
-        let num_bytes = cmp::min(8, self.total_bytes);
-        self.buffered_values = read_num_bytes::<u64>(num_bytes, self.buffer.as_ref());
+        self.buffered_values = 0;
         self.byte_offset = 0;
         self.bit_offset = 0;
     }
 
-    /// Gets the current byte offset
+    /// Returns the current byte offset, rounded up to the next whole byte.
+    ///
+    /// This is the index of the next byte that a byte-aligned
+    /// read (such as [`BitReader::get_aligned`]) would consume.
     #[inline]
     pub fn get_byte_offset(&self) -> usize {
         self.byte_offset + ceil(self.bit_offset, 8)
     }
 
-    /// Reads a value of type `T` and of size `num_bits`.
+    /// Reads a single bit-packed value of `num_bits` bits as a `T` from the
+    /// stream.
     ///
-    /// Returns `None` if there's not enough data available. `Some` otherwise.
-    pub fn get_value<T: FromBytes>(&mut self, num_bits: usize) -> Option<T> {
-        assert!(num_bits <= 64);
-        assert!(num_bits <= size_of::<T>() * 8);
+    /// The value is read as the low `num_bits` bits of `T`. Bits are consumed
+    /// from the stream in little-endian bit order.
+    ///
+    /// Returns `None` if there are fewer than `num_bits` bits left in the
+    /// buffer; otherwise `Some(value)`. On `None` the reader's position is
+    /// left unchanged.
+    pub fn get_value<T: FromBitpacked>(&mut self, num_bits: usize) -> Option<T> {
+        debug_assert!(num_bits <= 64);
+        debug_assert!(num_bits <= size_of::<T>() * 8);
 
-        if self.byte_offset * 8 + self.bit_offset + num_bits > self.total_bytes * 8 {
+        if self.byte_offset * 8 + self.bit_offset + num_bits > self.buffer.len() * 8 {
             return None;
         }
 
-        let mut v = trailing_bits(self.buffered_values, self.bit_offset + num_bits)
-            >> self.bit_offset;
+        // If buffer is not byte aligned, `self.buffered_values` will
+        // have already been populated
+        if self.bit_offset == 0 {
+            self.load_buffered_values()
+        }
+
+        let mut v =
+            trailing_bits(self.buffered_values, self.bit_offset + num_bits) >> self.bit_offset;
         self.bit_offset += num_bits;
 
         if self.bit_offset >= 64 {
             self.byte_offset += 8;
             self.bit_offset -= 64;
 
-            self.reload_buffer_values();
-            v |= trailing_bits(self.buffered_values, self.bit_offset)
-                .wrapping_shl((num_bits - self.bit_offset) as u32);
+            // If the new bit_offset is not 0, we need to read the next 64-bit chunk
+            // to buffered_values and update `v`
+            if self.bit_offset != 0 {
+                self.load_buffered_values();
+
+                v |= trailing_bits(self.buffered_values, self.bit_offset)
+                    .wrapping_shl((num_bits - self.bit_offset) as u32);
+            }
         }
 
-        // TODO: better to avoid copying here
-        Some(from_ne_slice(v.as_bytes()))
+        Some(T::from_u64(v))
     }
 
-    /// Skip one value of size `num_bits`.
+    /// Reads up to `batch.len()` bit-packed values of `num_bits` each, into
+    /// `batch`.
     ///
-    /// Returns `false` if there are no more values to skip, `true` otherwise.
-    pub fn skip_value(&mut self, num_bits: usize) -> bool {
-        assert!(num_bits <= 64);
-
-        if self.byte_offset * 8 + self.bit_offset + num_bits > self.total_bytes * 8 {
-            return false;
-        }
-
-        self.bit_offset += num_bits;
-
-        if self.bit_offset >= 64 {
-            self.byte_offset += 8;
-            self.bit_offset -= 64;
-
-            self.reload_buffer_values();
-        }
-
-        true
-    }
-
-    /// Read multiple values from their packed representation where each element is represented
-    /// by `num_bits` bits.
+    /// Equivalent to repeatedly calling [`BitReader::get_value`] with the same
+    /// `num_bits`, but faster because it dispatches to SIMD-friendly
+    /// fixed-width unpacking routines whenever possible.
+    ///
+    /// Returns the number of values actually written to `batch`. This will be
+    /// less than `batch.len()` if the underlying buffer is exhausted before
+    /// `batch` is filled.
     ///
     /// # Panics
     ///
     /// This function panics if
     /// - `num_bits` is larger than the bit-capacity of `T`
-    ///
-    pub fn get_batch<T: FromBytes>(&mut self, batch: &mut [T], num_bits: usize) -> usize {
-        assert!(num_bits <= size_of::<T>() * 8);
+    pub fn get_batch<T: FromBitpacked>(&mut self, batch: &mut [T], num_bits: usize) -> usize {
+        debug_assert!(num_bits <= size_of::<T>() * 8);
 
         let mut values_to_read = batch.len();
         let needed_bits = num_bits * values_to_read;
-        let remaining_bits = (self.total_bytes - self.byte_offset) * 8 - self.bit_offset;
+        let remaining_bits = (self.buffer.len() - self.byte_offset) * 8 - self.bit_offset;
         if remaining_bits < needed_bits {
             values_to_read = remaining_bits / num_bits;
         }
@@ -446,46 +667,63 @@ impl BitReader {
             }
         }
 
-        let in_buf = self.buffer.data();
+        assert_ne!(T::BIT_CAPACITY, 0);
+        assert!(num_bits <= T::BIT_CAPACITY);
 
         // Read directly into output buffer
         match size_of::<T>() {
             1 => {
                 let ptr = batch.as_mut_ptr() as *mut u8;
+                // SAFETY: batch is properly aligned and sized. Caller guarantees that all bit patterns
+                // in which only the lowest T::BIT_CAPACITY bits of T are set are valid,
+                // unpack{8,16,32,64} only set to non0 the lowest num_bits bits, and we
+                // checked that num_bits <= T::BIT_CAPACITY.
                 let out = unsafe { std::slice::from_raw_parts_mut(ptr, batch.len()) };
                 while values_to_read - i >= 8 {
                     let out_slice = (&mut out[i..i + 8]).try_into().unwrap();
-                    unpack8(&in_buf[self.byte_offset..], out_slice, num_bits);
+                    unpack8(&self.buffer[self.byte_offset..], out_slice, num_bits);
                     self.byte_offset += num_bits;
                     i += 8;
                 }
             }
             2 => {
                 let ptr = batch.as_mut_ptr() as *mut u16;
+                // SAFETY: batch is properly aligned and sized. Caller guarantees that all bit patterns
+                // in which only the lowest T::BIT_CAPACITY bits of T are set are valid,
+                // unpack{8,16,32,64} only set to non0 the lowest num_bits bits, and we
+                // checked that num_bits <= T::BIT_CAPACITY.
                 let out = unsafe { std::slice::from_raw_parts_mut(ptr, batch.len()) };
                 while values_to_read - i >= 16 {
                     let out_slice = (&mut out[i..i + 16]).try_into().unwrap();
-                    unpack16(&in_buf[self.byte_offset..], out_slice, num_bits);
+                    unpack16(&self.buffer[self.byte_offset..], out_slice, num_bits);
                     self.byte_offset += 2 * num_bits;
                     i += 16;
                 }
             }
             4 => {
                 let ptr = batch.as_mut_ptr() as *mut u32;
+                // SAFETY: batch is properly aligned and sized. Caller guarantees that all bit patterns
+                // in which only the lowest T::BIT_CAPACITY bits of T are set are valid,
+                // unpack{8,16,32,64} only set to non0 the lowest num_bits bits, and we
+                // checked that num_bits <= T::BIT_CAPACITY.
                 let out = unsafe { std::slice::from_raw_parts_mut(ptr, batch.len()) };
                 while values_to_read - i >= 32 {
                     let out_slice = (&mut out[i..i + 32]).try_into().unwrap();
-                    unpack32(&in_buf[self.byte_offset..], out_slice, num_bits);
+                    unpack32(&self.buffer[self.byte_offset..], out_slice, num_bits);
                     self.byte_offset += 4 * num_bits;
                     i += 32;
                 }
             }
             8 => {
                 let ptr = batch.as_mut_ptr() as *mut u64;
+                // SAFETY: batch is properly aligned and sized. Caller guarantees that all bit patterns
+                // in which only the lowest T::BIT_CAPACITY bits of T are set are valid,
+                // unpack{8,16,32,64} only set to non0 the lowest num_bits bits, and we
+                // checked that num_bits <= T::BIT_CAPACITY.
                 let out = unsafe { std::slice::from_raw_parts_mut(ptr, batch.len()) };
                 while values_to_read - i >= 64 {
                     let out_slice = (&mut out[i..i + 64]).try_into().unwrap();
-                    unpack64(&in_buf[self.byte_offset..], out_slice, num_bits);
+                    unpack64(&self.buffer[self.byte_offset..], out_slice, num_bits);
                     self.byte_offset += 8 * num_bits;
                     i += 64;
                 }
@@ -496,7 +734,7 @@ impl BitReader {
         // Try to read smaller batches if possible
         if size_of::<T>() > 4 && values_to_read - i >= 32 && num_bits <= 32 {
             let mut out_buf = [0_u32; 32];
-            unpack32(&in_buf[self.byte_offset..], &mut out_buf, num_bits);
+            unpack32(&self.buffer[self.byte_offset..], &mut out_buf, num_bits);
             self.byte_offset += 4 * num_bits;
 
             for out in out_buf {
@@ -510,7 +748,7 @@ impl BitReader {
 
         if size_of::<T>() > 2 && values_to_read - i >= 16 && num_bits <= 16 {
             let mut out_buf = [0_u16; 16];
-            unpack16(&in_buf[self.byte_offset..], &mut out_buf, num_bits);
+            unpack16(&self.buffer[self.byte_offset..], &mut out_buf, num_bits);
             self.byte_offset += 2 * num_bits;
 
             for out in out_buf {
@@ -524,7 +762,7 @@ impl BitReader {
 
         if size_of::<T>() > 1 && values_to_read - i >= 8 && num_bits <= 8 {
             let mut out_buf = [0_u8; 8];
-            unpack8(&in_buf[self.byte_offset..], &mut out_buf, num_bits);
+            unpack8(&self.buffer[self.byte_offset..], &mut out_buf, num_bits);
             self.byte_offset += num_bits;
 
             for out in out_buf {
@@ -535,8 +773,6 @@ impl BitReader {
                 i += 1;
             }
         }
-
-        self.reload_buffer_values();
 
         // Read any trailing values
         while i < values_to_read {
@@ -550,120 +786,129 @@ impl BitReader {
         values_to_read
     }
 
-    /// Skip num_value values with num_bits bit width
+    /// Skips `num_values` bit-packed values of `num_bits` bits, advancing the
+    /// reader past them without decoding.
     ///
-    /// Return the number of values skipped (up to num_values)
+    /// Returns the number of values actually skipped (up to `num_values`).
+    /// This will be less than `num_values` if the underlying buffer is
+    /// exhausted.
     pub fn skip(&mut self, num_values: usize, num_bits: usize) -> usize {
-        assert!(num_bits <= 64);
+        debug_assert!(num_bits <= 64);
 
-        let mut num_values = num_values;
         let needed_bits = num_bits * num_values;
-        let remaining_bits = (self.total_bytes - self.byte_offset) * 8 - self.bit_offset;
-        if remaining_bits < needed_bits {
-            num_values = remaining_bits / num_bits;
-        }
+        let remaining_bits = (self.buffer.len() - self.byte_offset) * 8 - self.bit_offset;
 
-        let mut values_skipped = 0;
+        let values_to_read = match remaining_bits < needed_bits {
+            true => remaining_bits / num_bits,
+            false => num_values,
+        };
 
-        // First align bit offset to byte offset
+        let end_bit_offset = self.byte_offset * 8 + values_to_read * num_bits + self.bit_offset;
+
+        self.byte_offset = end_bit_offset / 8;
+        self.bit_offset = end_bit_offset % 8;
+
         if self.bit_offset != 0 {
-            while values_skipped < num_values && self.bit_offset != 0 {
-                self.skip_value(num_bits);
-                values_skipped += 1;
-            }
+            self.load_buffered_values()
         }
 
-        while num_values - values_skipped >= 32 {
-            self.byte_offset += 4 * num_bits;
-            values_skipped += 32;
-        }
-
-        assert!(num_values - values_skipped < 32);
-
-        self.reload_buffer_values();
-        while values_skipped < num_values {
-            self.skip_value(num_bits);
-            values_skipped += 1;
-        }
-
-        num_values
+        values_to_read
     }
 
-    /// Reads up to `num_bytes` to `buf` returning the number of bytes read
-    pub(crate) fn get_aligned_bytes(
-        &mut self,
-        buf: &mut Vec<u8>,
-        num_bytes: usize,
-    ) -> usize {
+    /// Reads up to `num_bytes` bytes from the stream, appending them to `buf`,
+    /// and returns the number of bytes actually appended.
+    ///
+    /// The reader is first advanced to the next byte boundary, so any
+    /// in-progress bit-level read is discarded before the bytes are copied.
+    pub(crate) fn get_aligned_bytes(&mut self, buf: &mut Vec<u8>, num_bytes: usize) -> usize {
         // Align to byte offset
-        self.byte_offset += ceil(self.bit_offset as i64, 8) as usize;
+        self.byte_offset = self.get_byte_offset();
         self.bit_offset = 0;
 
-        let src = &self.buffer.data()[self.byte_offset..];
+        let src = &self.buffer[self.byte_offset..];
         let to_read = num_bytes.min(src.len());
         buf.extend_from_slice(&src[..to_read]);
 
         self.byte_offset += to_read;
-        self.reload_buffer_values();
 
         to_read
     }
 
-    /// Reads a `num_bytes`-sized value from this buffer and return it.
-    /// `T` needs to be a little-endian native type. The value is assumed to be byte
-    /// aligned so the bit reader will be advanced to the start of the next byte before
-    /// reading the value.
-
-    /// Returns `Some` if there's enough bytes left to form a value of `T`.
-    /// Otherwise `None`.
+    /// Reads a `num_bytes`-sized value of type `T` from the stream.
+    ///
+    /// `T` is interpreted as a little-endian native type. The value is
+    /// assumed to be byte aligned, so the reader is first advanced to the
+    /// start of the next byte before reading.
+    ///
+    /// Returns `Some(value)` if there are at least `num_bytes` bytes left in
+    /// the buffer after byte-alignment, and `None` otherwise. On `None` the
+    /// reader's byte position is still advanced to the alignment boundary.
     pub fn get_aligned<T: FromBytes>(&mut self, num_bytes: usize) -> Option<T> {
-        let bytes_read = ceil(self.bit_offset, 8);
-        if self.byte_offset + bytes_read + num_bytes > self.total_bytes {
+        self.byte_offset = self.get_byte_offset();
+        self.bit_offset = 0;
+
+        if self.byte_offset + num_bytes > self.buffer.len() {
             return None;
         }
 
         // Advance byte_offset to next unread byte and read num_bytes
-        self.byte_offset += bytes_read;
-        let v = read_num_bytes::<T>(num_bytes, &self.buffer.data()[self.byte_offset..]);
+        let v = read_num_bytes::<T>(num_bytes, &self.buffer[self.byte_offset..]);
         self.byte_offset += num_bytes;
 
-        // Reset buffered_values
-        self.bit_offset = 0;
-        self.reload_buffer_values();
         Some(v)
     }
 
-    /// Reads a VLQ encoded (in little endian order) int from the stream.
-    /// The encoded int must start at the beginning of a byte.
+    /// Reads a VLQ-encoded (in little-endian order) integer from the stream.
     ///
-    /// Returns `None` if there's not enough bytes in the stream. `Some` otherwise.
+    /// The encoded integer must start at the beginning of a byte; the reader
+    /// is first advanced to the next byte boundary before decoding.
+    ///
+    /// Returns `Some(value)` on success, or `None` if the buffer is exhausted
+    /// before a complete VLQ value is read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the encoded integer is longer than [`MAX_VLQ_BYTE_LEN`]
+    /// bytes (bad input).
     pub fn get_vlq_int(&mut self) -> Option<i64> {
+        // Align to byte boundary once, then read bytes directly
+        self.byte_offset = self.get_byte_offset();
+        self.bit_offset = 0;
+
+        let buf = &self.buffer[self.byte_offset..];
         let mut shift = 0;
         let mut v: i64 = 0;
-        while let Some(byte) = self.get_aligned::<u8>(1) {
+
+        for (i, &byte) in buf.iter().enumerate() {
             v |= ((byte & 0x7F) as i64) << shift;
             shift += 7;
             assert!(
                 shift <= MAX_VLQ_BYTE_LEN * 7,
-                "Num of bytes exceed MAX_VLQ_BYTE_LEN ({})",
-                MAX_VLQ_BYTE_LEN
+                "Num of bytes exceed MAX_VLQ_BYTE_LEN ({MAX_VLQ_BYTE_LEN})"
             );
             if byte & 0x80 == 0 {
+                self.byte_offset += i + 1;
                 return Some(v);
             }
         }
         None
     }
 
-    /// Reads a zigzag-VLQ encoded (in little endian order) int from the stream
-    /// Zigzag-VLQ is a variant of VLQ encoding where negative and positive numbers are
-    /// encoded in a zigzag fashion.
-    /// See: https://developers.google.com/protocol-buffers/docs/encoding
+    /// Reads a zigzag-VLQ-encoded little-endian integer from the
+    /// stream.
     ///
-    /// Note: the encoded int must start at the beginning of a byte.
+    /// Zigzag-VLQ is a variant of VLQ encoding where negative and positive
+    /// numbers are interleaved so that small absolute values produce short
+    /// encodings regardless of sign. See the [Protocol Buffers encoding
+    /// documentation](https://developers.google.com/protocol-buffers/docs/encoding)
+    /// for details.
     ///
-    /// Returns `None` if the number of bytes there's not enough bytes in the stream.
-    /// `Some` otherwise.
+    /// As with [`BitReader::get_vlq_int`], the encoded integer must start at
+    /// the beginning of a byte; the reader is first advanced to the next
+    /// byte boundary before decoding.
+    ///
+    /// Returns `Some(value)` on success, or `None` if the buffer is exhausted
+    /// before a complete value is read.
     #[inline]
     pub fn get_zigzag_vlq_int(&mut self) -> Option<i64> {
         self.get_vlq_int().map(|v| {
@@ -672,17 +917,22 @@ impl BitReader {
         })
     }
 
-    fn reload_buffer_values(&mut self) {
-        let bytes_to_read = cmp::min(self.total_bytes - self.byte_offset, 8);
+    /// Loads up to the next 8 bytes from `self.buffer` at `self.byte_offset`
+    /// into `self.buffered_values`.
+    ///
+    /// Reads fewer than 8 bytes if there are fewer than 8 bytes left
+    #[inline]
+    fn load_buffered_values(&mut self) {
+        let bytes_to_read = cmp::min(self.buffer.len() - self.byte_offset, 8);
         self.buffered_values =
-            read_num_bytes::<u64>(bytes_to_read, &self.buffer.data()[self.byte_offset..]);
+            read_num_bytes::<u64>(bytes_to_read, &self.buffer[self.byte_offset..]);
     }
 }
 
 impl From<Vec<u8>> for BitReader {
     #[inline]
     fn from(buffer: Vec<u8>) -> Self {
-        BitReader::new(ByteBufferPtr::new(buffer))
+        BitReader::new(buffer.into())
     }
 }
 
@@ -691,7 +941,7 @@ mod tests {
     use super::*;
 
     use crate::util::test_common::rand_gen::random_numbers;
-    use rand::distributions::{Distribution, Standard};
+    use rand::distr::{Distribution, StandardUniform};
     use std::fmt::Debug;
 
     #[test]
@@ -735,26 +985,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bit_reader_skip_value() {
-        let buffer = vec![255, 0];
-        let mut bit_reader = BitReader::from(buffer);
-        let skipped = bit_reader.skip_value(1);
-        assert!(skipped);
-        assert_eq!(bit_reader.get_value::<i32>(1), Some(1));
-        let skipped = bit_reader.skip_value(2);
-        assert!(skipped);
-        assert_eq!(bit_reader.get_value::<i32>(2), Some(3));
-        let skipped = bit_reader.skip_value(1);
-        assert!(skipped);
-        assert_eq!(bit_reader.get_value::<i32>(4), Some(1));
-        let skipped = bit_reader.skip_value(1);
-        assert!(skipped);
-        assert_eq!(bit_reader.get_value::<i32>(4), Some(0));
-        let skipped = bit_reader.skip_value(1);
-        assert!(!skipped);
-    }
-
-    #[test]
     fn test_bit_reader_skip() {
         let buffer = vec![255, 0];
         let mut bit_reader = BitReader::from(buffer);
@@ -786,8 +1016,7 @@ mod tests {
         let buffer = vec![10, 0, 0, 0, 20, 0, 30, 0, 0, 0, 40, 0];
         let mut bit_reader = BitReader::from(buffer);
         assert_eq!(bit_reader.get_value::<i64>(32), Some(10));
-        let skipped = bit_reader.skip_value(16);
-        assert!(skipped);
+        assert_eq!(bit_reader.skip(1, 16), 1);
         assert_eq!(bit_reader.get_value::<i64>(32), Some(30));
         assert_eq!(bit_reader.get_value::<i64>(16), Some(40));
     }
@@ -795,12 +1024,12 @@ mod tests {
     #[test]
     fn test_bit_reader_get_aligned() {
         // 01110101 11001011
-        let buffer = ByteBufferPtr::new(vec![0x75, 0xCB]);
-        let mut bit_reader = BitReader::new(buffer.all());
+        let buffer = Bytes::from(vec![0x75, 0xCB]);
+        let mut bit_reader = BitReader::new(buffer.clone());
         assert_eq!(bit_reader.get_value::<i32>(3), Some(5));
         assert_eq!(bit_reader.get_aligned::<i32>(1), Some(203));
         assert_eq!(bit_reader.get_value::<i32>(1), None);
-        bit_reader.reset(buffer.all());
+        bit_reader.reset(buffer.clone());
         assert_eq!(bit_reader.get_aligned::<i32>(3), None);
     }
 
@@ -969,12 +1198,12 @@ mod tests {
     fn test_put_value_rand_numbers(total: usize, num_bits: usize) {
         assert!(num_bits < 64);
         let num_bytes = ceil(num_bits, 8);
-        let mut writer = BitWriter::new(num_bytes as usize * total);
+        let mut writer = BitWriter::new(num_bytes * total);
         let values: Vec<u64> = random_numbers::<u64>(total)
             .iter()
             .map(|v| v & ((1 << num_bits) - 1))
             .collect();
-        (0..total).for_each(|i| writer.put_value(values[i] as u64, num_bits));
+        (0..total).for_each(|i| writer.put_value(values[i], num_bits));
 
         let mut reader = BitReader::from(writer.consume());
         (0..total).for_each(|i| {
@@ -1006,11 +1235,11 @@ mod tests {
 
     fn test_get_batch_helper<T>(total: usize, num_bits: usize)
     where
-        T: FromBytes + Default + Clone + Debug + Eq,
+        T: FromBitpacked + Default + Clone + Debug + Eq,
     {
         assert!(num_bits <= 64);
         let num_bytes = ceil(num_bits, 8);
-        let mut writer = BitWriter::new(num_bytes as usize * total);
+        let mut writer = BitWriter::new(num_bytes * total);
 
         let mask = match num_bits {
             64 => u64::MAX,
@@ -1023,10 +1252,12 @@ mod tests {
             .collect();
 
         // Generic values used to check against actual values read from `get_batch`.
-        let expected_values: Vec<T> =
-            values.iter().map(|v| from_ne_slice(v.as_bytes())).collect();
+        let expected_values: Vec<T> = values
+            .iter()
+            .map(|v| T::try_from_le_slice(v.as_bytes()).unwrap())
+            .collect();
 
-        (0..total).for_each(|i| writer.put_value(values[i] as u64, num_bits));
+        (0..total).for_each(|i| writer.put_value(values[i], num_bits));
 
         let buf = writer.consume();
         let mut reader = BitReader::from(buf);
@@ -1060,7 +1291,7 @@ mod tests {
     fn test_put_aligned_rand_numbers<T>(total: usize, num_bits: usize)
     where
         T: Copy + FromBytes + AsBytes + Debug + PartialEq,
-        Standard: Distribution<T>,
+        StandardUniform: Distribution<T>,
     {
         assert!(num_bits <= 32);
         assert!(total % 2 == 0);
@@ -1152,7 +1383,7 @@ mod tests {
     #[test]
     fn test_get_batch_zero_extend() {
         let to_read = vec![0xFF; 4];
-        let mut reader = BitReader::new(ByteBufferPtr::new(to_read));
+        let mut reader = BitReader::from(to_read);
 
         // Create a non-zeroed output buffer
         let mut output = [u64::MAX; 32];

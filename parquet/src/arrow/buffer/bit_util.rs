@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::util::bit_chunk_iterator::UnalignedBitChunk;
+use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 use std::ops::Range;
 
 /// Counts the number of set bits in the provided range
@@ -28,39 +28,50 @@ pub fn count_set_bits(bytes: &[u8], range: Range<usize>) -> usize {
 pub fn iter_set_bits_rev(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
     let bit_length = bytes.len() * 8;
     let unaligned = UnalignedBitChunk::new(bytes, 0, bit_length);
-    let mut chunk_end_idx =
-        bit_length + unaligned.lead_padding() + unaligned.trailing_padding();
+    let mut chunk_end_idx = bit_length + unaligned.lead_padding() + unaligned.trailing_padding();
 
     let iter = unaligned
         .prefix()
         .into_iter()
         .chain(unaligned.chunks().iter().cloned())
-        .chain(unaligned.suffix().into_iter());
+        .chain(unaligned.suffix());
 
-    iter.rev().flat_map(move |mut chunk| {
+    iter.rev().flat_map(move |chunk| {
         let chunk_idx = chunk_end_idx - 64;
         chunk_end_idx = chunk_idx;
+        let mut rev_chunk = chunk.reverse_bits();
         std::iter::from_fn(move || {
-            if chunk != 0 {
-                let bit_pos = 63 - chunk.leading_zeros();
-                chunk ^= 1 << bit_pos;
-                return Some(chunk_idx + (bit_pos as usize));
+            if rev_chunk != 0 {
+                let bit_pos = rev_chunk.trailing_zeros();
+                rev_chunk &= rev_chunk - 1;
+                return Some(chunk_idx + (63 - bit_pos as usize));
             }
             None
         })
     })
 }
 
+/// Performs big endian sign extension
+pub fn sign_extend_be<const N: usize>(b: &[u8]) -> [u8; N] {
+    assert!(b.len() <= N, "Array too large, expected less than {N}");
+    let is_negative = (b[0] & 128u8) == 128u8;
+    let mut result = if is_negative { [255u8; N] } else { [0u8; N] };
+    for (d, s) in result.iter_mut().skip(N - b.len()).zip(b) {
+        *d = *s;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::BooleanBufferBuilder;
-    use rand::prelude::*;
+    use arrow_array::builder::BooleanBufferBuilder;
+    use rand::{prelude::*, rng};
 
     #[test]
     fn test_bit_fns() {
-        let mut rng = thread_rng();
-        let mask_length = rng.gen_range(1..1024);
+        let mut rng = rng();
+        let mask_length = rng.random_range(1..1024);
         let bools: Vec<_> = std::iter::from_fn(|| Some(rng.next_u32() & 1 == 0))
             .take(mask_length)
             .collect();
@@ -73,7 +84,7 @@ mod tests {
             .iter()
             .enumerate()
             .rev()
-            .filter_map(|(x, y)| y.then(|| x))
+            .filter_map(|(x, y)| y.then_some(x))
             .collect();
         assert_eq!(actual, expected);
 
@@ -82,8 +93,8 @@ mod tests {
         assert_eq!(count_set_bits(&[0xFF], 1..1), 0);
 
         for _ in 0..20 {
-            let start = rng.gen_range(0..bools.len());
-            let end = rng.gen_range(start..bools.len());
+            let start = rng.random_range(0..bools.len());
+            let end = rng.random_range(start..bools.len());
 
             let actual = count_set_bits(nulls.as_slice(), start..end);
             let expected = bools[start..end].iter().filter(|x| **x).count();

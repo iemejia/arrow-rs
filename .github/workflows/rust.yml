@@ -18,27 +18,29 @@
 # workspace wide tests
 name: rust
 
-# trigger for all PRs and changes to master
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+# trigger for all PRs and changes to main
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
 
 jobs:
-
   # Check workspace wide compile and test with default features for
   # mac
   macos:
     name: Test on Mac
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Install protoc with brew
-        run: |
-          brew install protobuf
+        run: brew install protobuf
       - name: Setup Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update
@@ -48,8 +50,8 @@ jobs:
         run: |
           # do not produce debug symbols to keep memory usage down
           export RUSTFLAGS="-C debuginfo=0"
-          cargo test
-
+          # PyArrow tests happen in integration.yml.
+          cargo test --workspace
 
   # Check workspace wide compile and test with default features for
   # windows
@@ -57,7 +59,7 @@ jobs:
     name: Test on Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Install protobuf compiler in /d/protoc
@@ -80,8 +82,7 @@ jobs:
           # do not produce debug symbols to keep memory usage down
           export RUSTFLAGS="-C debuginfo=0"
           export PATH=$PATH:/d/protoc/bin
-          cargo test
-
+          cargo test --workspace
 
   # Run cargo fmt for all crates
   lint:
@@ -90,11 +91,41 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v2
-      - name: Setup toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-          rustup component add rustfmt
-      - name: Run
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Setup rustfmt
+        run: rustup component add rustfmt
+      - name: Format arrow
         run: cargo fmt --all -- --check
+      - name: Format parquet
+        # Many modules in parquet are skipped, so check parquet separately
+        # https://github.com/apache/arrow-rs/issues/6179
+        working-directory: parquet
+        run: |
+          # if this fails, run this from the parquet directory:
+          # cargo fmt -p parquet -- --config skip_children=true `find . -name "*.rs" \! -name format.rs`
+          cargo fmt -p parquet -- --check --config skip_children=true `find . -name "*.rs" \! -name format.rs`
+
+  msrv:
+    name: Verify MSRV (Minimum Supported Rust Version)
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Install cargo-msrv (if needed)
+        # cargo-msrv binary may be cached by the cargo cache step in setup-builder, and cargo install will error if it is already installed
+        # --locked uses cargo-msrv's pinned Cargo.lock; without it an unpinned transitive
+        # dep (aws-runtime) resolves to a version that fails to compile (E0282)
+        run: if which cargo-msrv ; then echo "using existing cargo-msrv binary" ; else cargo install cargo-msrv --locked ; fi
+      - name: Check all packages
+        run: |
+          # run `cargo msrv verify --manifest-path "path/to/Cargo.toml"` to see problematic dependencies
+          find . -mindepth 2 -name Cargo.toml | while read -r dir
+          do
+            echo "Checking package '$dir'"
+            cargo msrv verify --manifest-path "$dir" --output-format=json || exit 1
+          done

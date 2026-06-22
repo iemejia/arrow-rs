@@ -16,9 +16,7 @@
 // under the License.
 
 use crate::data_type::AsBytes;
-use hashbrown::hash_map::RawEntryMut;
-use hashbrown::HashMap;
-use std::hash::Hash;
+use hashbrown::HashTable;
 
 const DEFAULT_DEDUP_CAPACITY: usize = 4096;
 
@@ -26,13 +24,17 @@ const DEFAULT_DEDUP_CAPACITY: usize = 4096;
 pub trait Storage {
     type Key: Copy;
 
-    type Value: AsBytes + PartialEq + ?Sized;
+    type Value: AsBytes + ?Sized;
 
     /// Gets an element by its key
     fn get(&self, idx: Self::Key) -> &Self::Value;
 
     /// Adds a new element, returning the key
     fn push(&mut self, value: &Self::Value) -> Self::Key;
+
+    /// Return an estimate of the memory used in this storage, in bytes
+    #[allow(dead_code)] // not used in parquet_derive, so is dead there
+    fn estimated_memory_size(&self) -> usize;
 }
 
 /// A generic value interner supporting various different [`Storage`]
@@ -41,11 +43,7 @@ pub struct Interner<S: Storage> {
     state: ahash::RandomState,
 
     /// Used to provide a lookup from value to unique value
-    ///
-    /// Note: `S::Key`'s hash implementation is not used, instead the raw entry
-    /// API is used to store keys w.r.t the hash of the strings themselves
-    ///
-    dedup: HashMap<S::Key, (), ()>,
+    dedup: HashTable<S::Key>,
 
     storage: S,
 }
@@ -55,32 +53,31 @@ impl<S: Storage> Interner<S> {
     pub fn new(storage: S) -> Self {
         Self {
             state: Default::default(),
-            dedup: HashMap::with_capacity_and_hasher(DEFAULT_DEDUP_CAPACITY, ()),
+            dedup: HashTable::with_capacity(DEFAULT_DEDUP_CAPACITY),
             storage,
         }
     }
 
     /// Intern the value, returning the interned key, and if this was a new value
     pub fn intern(&mut self, value: &S::Value) -> S::Key {
-        let hash = compute_hash(&self.state, value);
+        let hash = self.state.hash_one(value.as_bytes());
 
-        let entry = self
+        *self
             .dedup
-            .raw_entry_mut()
-            .from_hash(hash, |index| value == self.storage.get(*index));
+            .entry(
+                hash,
+                // Compare bytes rather than directly comparing values so NaNs can be interned
+                |index| value.as_bytes() == self.storage.get(*index).as_bytes(),
+                |key| self.state.hash_one(self.storage.get(*key).as_bytes()),
+            )
+            .or_insert_with(|| self.storage.push(value))
+            .get()
+    }
 
-        match entry {
-            RawEntryMut::Occupied(entry) => *entry.into_key(),
-            RawEntryMut::Vacant(entry) => {
-                let key = self.storage.push(value);
-
-                *entry
-                    .insert_with_hasher(hash, key, (), |key| {
-                        compute_hash(&self.state, self.storage.get(*key))
-                    })
-                    .0
-            }
-        }
+    /// Return estimate of the memory used, in bytes
+    #[allow(dead_code)] // not used in parquet_derive, so is dead there
+    pub fn estimated_memory_size(&self) -> usize {
+        self.storage.estimated_memory_size() + self.dedup.allocation_size()
     }
 
     /// Returns the storage for this interner
@@ -89,14 +86,8 @@ impl<S: Storage> Interner<S> {
     }
 
     /// Unwraps the inner storage
+    #[cfg(feature = "arrow")]
     pub fn into_inner(self) -> S {
         self.storage
     }
-}
-
-fn compute_hash<T: AsBytes + ?Sized>(state: &ahash::RandomState, value: &T) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = state.build_hasher();
-    value.as_bytes().hash(&mut hasher);
-    hasher.finish()
 }

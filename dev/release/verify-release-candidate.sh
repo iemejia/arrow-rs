@@ -33,23 +33,27 @@ set -o pipefail
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 ARROW_DIR="$(dirname $(dirname ${SOURCE_DIR}))"
-ARROW_DIST_URL='https://dist.apache.org/repos/dist/dev/arrow'
+ARROW_RC_URL="https://dist.apache.org/repos/dist/dev/arrow"
+ARROW_KEYS_URL="https://www.apache.org/dyn/closer.lua?action=download&filename=arrow/KEYS"
 
-download_dist_file() {
+download_file() {
   curl \
     --silent \
     --show-error \
     --fail \
     --location \
-    --remote-name $ARROW_DIST_URL/$1
+    --output "$2" \
+    "$1"
 }
 
 download_rc_file() {
-  download_dist_file apache-arrow-rs-${VERSION}-rc${RC_NUMBER}/$1
+  download_file \
+  "${ARROW_RC_URL}/apache-arrow-rs-${VERSION}-rc${RC_NUMBER}/$1" \
+  "$1"
 }
 
 import_gpg_keys() {
-  download_dist_file KEYS
+  download_file "${ARROW_KEYS_URL}" KEYS
   gpg --import KEYS
 }
 
@@ -113,19 +117,13 @@ test_source_distribution() {
   export ARROW_TEST_DATA=$PWD/arrow-testing-data/data
   export PARQUET_TEST_DATA=$PWD/parquet-testing-data/data
 
-  # use local modules because we don't publish modules to crates.io yet
-  sed \
-    -i.bak \
-    -E \
-    -e 's/^arrow = "([^"]*)"/arrow = { version = "\1", path = "..\/arrow" }/g' \
-    -e 's/^parquet = "([^"]*)"/parquet = { version = "\1", path = "..\/parquet" }/g' \
-    */Cargo.toml
-
-  cargo build
   cargo test --all
 
-  # verify that the crates can be published to crates.io
-  pushd arrow
+  # verify that the leaf crates can be published to crates.io
+  # we can't verify crates that depend on others
+  # (because the others haven't yet been published to crates.io)
+
+  pushd arrow-buffer
     cargo publish --dry-run
   popd
 

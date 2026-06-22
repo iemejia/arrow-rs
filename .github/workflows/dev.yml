@@ -17,11 +17,15 @@
 
 name: dev
 
-# trigger for all PRs and changes to master
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+# trigger for all PRs and changes to main
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
 
 env:
@@ -34,9 +38,9 @@ jobs:
     name: Release Audit Tool (RAT)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v6
         with:
           python-version: 3.8
       - name: Audit licenses
@@ -44,14 +48,14 @@ jobs:
 
   prettier:
     name: Markdown format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: "14"
       - name: Prettier check
         run: |
-          # if you encounter error, try rerun the command below with --write instead of --check
-          # and commit the changes
-          npx prettier@2.3.0 --check {arrow,arrow-flight,dev,integration-testing,parquet}/**/*.md README.md CODE_OF_CONDUCT.md CONTRIBUTING.md
+          # if you encounter error, run the command below and commit the changes
+          npx prettier@2.3.2 --write {arrow,arrow-flight,dev,arrow-integration-testing,parquet}/**/*.md README.md CODE_OF_CONDUCT.md CONTRIBUTING.md
+          git diff --exit-code

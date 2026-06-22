@@ -17,22 +17,40 @@
 
 name: miri
 
-# trigger for all PRs that touch certain files and changes to master
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+# trigger for all PRs that touch certain files and changes to main
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
     paths:
-      - arrow/**
       - .github/**
+      - arrow-array/**
+      - arrow-buffer/**
+      - arrow-cast/**
+      - arrow-csv/**
+      - arrow-data/**
+      - arrow-ipc/**
+      - arrow-json/**
+      - arrow-avro/**
+      - arrow-schema/**
+      - arrow-select/**
+      - arrow-string/**
+      - arrow/**
 
 jobs:
   miri-checks:
     name: MIRI
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        partition: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Setup Rust toolchain
@@ -40,9 +58,11 @@ jobs:
           rustup toolchain install nightly --component miri
           rustup override set nightly
           cargo miri setup
+      - name: Set up nextest
+        run: |
+          cargo install cargo-nextest --version 0.9.132 --locked
       - name: Run Miri Checks
         env:
           RUST_BACKTRACE: full
           RUST_LOG: "trace"
-        run: |
-          bash .github/workflows/miri.sh
+        run: bash .github/workflows/miri.sh ${{ matrix.partition }} 4
